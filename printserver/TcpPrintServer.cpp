@@ -33,7 +33,9 @@ String urlDecode(String str) {
       hex[2] = '\0';
       decoded += (char)strtol(hex, NULL, 16);
       i += 2;
-    } else {
+    } else if (c == '+') {
+      decoded += ' ';
+  } else {
       decoded += c;
     }
   }
@@ -144,7 +146,7 @@ void TcpPrintServer::processNewWebClients() {
     std::map<String, String> reqData = newHttpClient.parseUrlencodedRequestBody();
     newHttpClient.print("HTTP/1.1 200 OK \r\n\r\n<h1>OK</h1>");
     newHttpClient.flushSendBuffer();
-    WiFiManager::connectTo(reqData["SSID"].c_str(), urlDecode(reqData["password"]));
+    WiFiManager::connectTo(urlDecode(reqData["SSID"].c_str()), urlDecode(reqData["password"]));
   } else {
     newHttpClient.print("HTTP/1.1 404 Not Found \r\n\r\n<h1>Not found</h1>");
   }
