@@ -21,6 +21,27 @@
 #include "IppStream.h"
 #include "TcpPrintServer.h"
 
+String urlDecode(String str) {
+  String decoded = "";
+  char c;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (c == '%') {
+      char hex[3];
+      hex[0] = str.charAt(i+1);
+      hex[1] = str.charAt(i+2);
+      hex[2] = '\0';
+      decoded += (char)strtol(hex, NULL, 16);
+      i += 2;
+    } else if (c == '+') {
+      decoded += ' ';
+  } else {
+      decoded += c;
+    }
+  }
+  return decoded;
+}
+
 TcpPrintServer::TcpPrintServer(Printer** _printers, int _printerCount) : socketServer(SOCKET_SERVER_PORT), ippServer(IPP_SERVER_PORT), httpServer(HTTP_SERVER_PORT) {
   printers = _printers;
   printerCount = _printerCount;
@@ -125,7 +146,7 @@ void TcpPrintServer::processNewWebClients() {
     std::map<String, String> reqData = newHttpClient.parseUrlencodedRequestBody();
     newHttpClient.print("HTTP/1.1 200 OK \r\n\r\n<h1>OK</h1>");
     newHttpClient.flushSendBuffer();
-    WiFiManager::connectTo(reqData["SSID"].c_str(), reqData["password"]);
+    WiFiManager::connectTo(urlDecode(reqData["SSID"].c_str()), urlDecode(reqData["password"]));
   } else {
     newHttpClient.print("HTTP/1.1 404 Not Found \r\n\r\n<h1>Not found</h1>");
   }
