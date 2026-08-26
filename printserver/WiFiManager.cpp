@@ -26,10 +26,13 @@ bool WiFiManager::apEnabled = false;
 void WiFiManager::wifi_setup() {
   Serial.println("Connecting to WiFi...");
   WiFi.setAutoConnect(true);
+  WiFi.begin();
   unsigned long connectionStarted = millis();
   while(!(WiFi.isConnected() || (millis() - connectionStarted > CONNECTION_TIMEOUT_MS))) {
     delay(200);
+    Serial.print(".");
   }
+  Serial.println();
   if (WiFi.isConnected()) {
     apEnabled = false;
     WiFi.setAutoReconnect(true);
@@ -92,6 +95,7 @@ void WiFiManager::connectTo(String ssid, String password) {
     apEnabled = false;
   }
   Serial.printf("Connecting to %s\r\n", ssid.c_str());
+  WiFi.persistent(true);
   WiFi.begin(ssid.c_str(), password.c_str());
   wifi_setup();
 }
