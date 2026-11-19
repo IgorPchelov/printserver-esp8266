@@ -97,4 +97,6 @@
 // ---------------------------------------------------------------- Misc
 #define STATUS_POLL_MS     250    // LPT status lines polling period
 #define OLED_UPDATE_MS     250    // OLED refresh period
+#define OLED_ERROR_SHOW_MS 10000  // transient error banner (line 2) lifetime;
+                                  // line 1 (network) must not stay hidden long
 #define REBOOT_ON_ERROR_DELAY_MS 30000

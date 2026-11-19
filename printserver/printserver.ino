@@ -514,6 +514,9 @@ void setup() {
     if (s == LptStatus::ERROR_STATE) display.setError("ошибка принтера");
     else display.clearError();
   };
+  display.setPrinterStatus(lpt.status());   // pump the boot-time status in:
+  // with no printer on the port the display must say "принтер не подключен"
+  // right away - the callback only fires on a status CHANGE
   Serial.println("boot ok: " + net.info());
 }
 

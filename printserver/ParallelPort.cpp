@@ -85,10 +85,16 @@ void ParallelPort::begin() {
 }
 
 LptStatus ParallelPort::rawStatus() {
-  bool err  = (digitalRead(PIN_LPT_ERROR)  == LOW);
-  bool pe   = (digitalRead(PIN_LPT_PE)     == HIGH);
-  bool sel  = (digitalRead(PIN_LPT_SELECT) == HIGH);
-  bool busy = (digitalRead(PIN_LPT_BUSY)   == HIGH);
+  // Only trust a status line that was seen wired at boot: a line the LPT
+  // connector left floating (board on a desk with no printer/cable) must
+  // not fake a printer into existence via a stray high level. A printer
+  // that is really connected drives all five lines, so "SELECT wired AND
+  // high" is the honest test of a present printer; everything unwired
+  // reads as not asserted.
+  bool err  = lineWired(W_ERROR)  && (digitalRead(PIN_LPT_ERROR)  == LOW);
+  bool pe   = lineWired(W_PE)     && (digitalRead(PIN_LPT_PE)     == HIGH);
+  bool sel  = lineWired(W_SELECT) && (digitalRead(PIN_LPT_SELECT) == HIGH);
+  bool busy = lineWired(W_BUSY)   && (digitalRead(PIN_LPT_BUSY)   == HIGH);
   lastBusy = busy; lastPe = pe; lastSelect = sel; lastError = err;
   if (err)            return LptStatus::ERROR_STATE;
   if (pe)             return LptStatus::PAPER_OUT;
@@ -98,8 +104,8 @@ LptStatus ParallelPort::rawStatus() {
 }
 
 bool ParallelPort::isAccepting() {
-  return digitalRead(PIN_LPT_BUSY)   == LOW
-      && digitalRead(PIN_LPT_SELECT) == HIGH
+  return lineWired(W_SELECT) && digitalRead(PIN_LPT_SELECT) == HIGH
+      && digitalRead(PIN_LPT_BUSY)   == LOW
       && digitalRead(PIN_LPT_ERROR)  == HIGH
       && digitalRead(PIN_LPT_PE)     == LOW;
 }
@@ -154,6 +160,16 @@ bool ParallelPort::writeByte(uint8_t b, uint32_t timeoutMs) {
 }
 
 void ParallelPort::poll() {
+  // Self-healing wiring mask: a line asserting its active level IS driven
+  // by a real printer, so mark it wired from now on. A floating line,
+  // biased by the internal pulls, can never assert - so "no line has ever
+  // asserted" honestly means "no printer on the port". This also recovers
+  // when the printer is powered on AFTER the ESP (boot sampling misses it).
+  if (digitalRead(PIN_LPT_SELECT) == HIGH) wiredMask |= W_SELECT;
+  if (digitalRead(PIN_LPT_BUSY)   == HIGH) wiredMask |= W_BUSY;
+  if (digitalRead(PIN_LPT_PE)     == HIGH) wiredMask |= W_PE;
+  if (digitalRead(PIN_LPT_ERROR)  == LOW)  wiredMask |= W_ERROR;
+  if (digitalRead(PIN_LPT_ACK)    == LOW)  wiredMask |= W_ACK;
   LptStatus s = rawStatus();
   if (s != debStatus) {
     debStatus = s;

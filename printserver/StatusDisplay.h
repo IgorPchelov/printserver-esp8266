@@ -1,18 +1,21 @@
 /*
  * StatusDisplay.h - 0.91" 128x32 SSD1306 OLED status line.
  *
- * Shows (Russian, per user requirements):
- *   a) "подключение к wifi..." while joining a network
- *   b) "AP 192.168.4.1"       in access-point mode (actual AP IP)
- *   c) "IP 192.168.1.200"     when connected (actual station IP)
+ * Layout concept (user): line 1 = connectivity only - firmware name at
+ * boot / while joining WiFi, station IP once connected, AP IP while in
+ * setup mode. Line 2 = what is going on / printer state:
+ *   a) "Подключение к WiFi..." while joining a network
+ *   b) "сеть не найдена"       why we are in access-point mode
+ *   c) "готов"                 connected + printer online
  *   d) "Загрузка данных"       while receiving a print job
  *   e) "печать..."             while feeding bytes to the printer
  *   f) "нет бумаги"            when PE is asserted
- *   g) "ошибка"                on printer/hardware errors
- * Second line by state: boot/wifi join -> "Подключение к WiFi...",
- * connected -> mDNS host name, AP mode -> "сеть не найдена" (why we are
- * in AP), receiving/printing -> host + printer status. A small activity
- * icon in the top-right corner animates while busy.
+ *   g) "ошибка принтера"       LPT ERROR asserted (transient errors like
+ *                              "ошибка LPT"/"ошибка PWG" also land here and
+ *                              auto-expire after OLED_ERROR_SHOW_MS so line 1
+ *                              is never held hostage by a one-shot message)
+ *   h) "принтер не подключен"  LPT status lines unreadable / SELECT low
+ * A small activity icon in the top-right corner animates while busy.
  *
  * This file is part of a port of gianluca-nitti/printserver-esp8266 (GPLv3).
  */
@@ -46,6 +49,7 @@ private:
   UiState state = UiState::BOOT;
   LptStatus printerStatus = LptStatus::UNKNOWN;
   String errorText = "";
+  uint32_t errorUntil = 0;           // millis() when errorText auto-expires
   uint32_t lastDraw = 0;
   uint8_t animFrame = 0;
   bool dirty = true;

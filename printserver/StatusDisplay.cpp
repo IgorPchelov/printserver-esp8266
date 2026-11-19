@@ -22,6 +22,7 @@ void StatusDisplay::setState(UiState s) {
 
 void StatusDisplay::setError(const String& e) {
   if (errorText != e) { errorText = e; dirty = true; }
+  errorUntil = millis() + OLED_ERROR_SHOW_MS;   // auto-expires, see tick()
 }
 
 void StatusDisplay::clearError() {
@@ -39,9 +40,15 @@ void StatusDisplay::off() {
 void StatusDisplay::tick() {
   if (!u8g2) return;
   uint32_t now = millis();
-  if (now - lastDraw < OLED_UPDATE_MS) return;
+  // transient error banner auto-expires so the network line (line 1) is
+  // never held hostage by a one-shot failure message
+  if (errorText.length() && (int32_t)(now - errorUntil) >= 0) {
+    errorText = ""; dirty = true;
+  }
+  if (now - lastDraw < OLED_UPDATE_MS && !dirty) return;
   lastDraw = now;
   animFrame++;
+  dirty = false;
   u8g2->setPowerSave(0);
   render();
 }
@@ -50,26 +57,34 @@ void StatusDisplay::render() {
   if (!u8g2) return;
   u8g2->clearBuffer();
 
-  // --- decide the main line ------------------------------------------
+  // Display concept (user): line 1 = connectivity - firmware name at boot,
+  // station IP once joined, AP IP while in setup mode; line 2 = what is
+  // going on / printer state. Line 1 never shows job or printer states.
   String line1;
   bool busyAnim = false;
   LptStatus effective = printerStatus;
 
-  if (errorText.length()) {
-    line1 = errorText;                       // g) errors override everything
-  } else if (effective == LptStatus::PAPER_OUT) {
-    line1 = "нет бумаги";                    // f)
-  } else if (effective == LptStatus::ERROR_STATE) {
-    line1 = "ошибка";                        // g)
+  // current connectivity address: AP IP in AP mode (even if the STA side
+  // briefly associates during a retry - the user is on our AP), otherwise
+  // the station IP; a job can also legitimately arrive from a client on
+  // our own AP, so the working states reuse the same choice
+  String addr;
+  if (state == UiState::AP_MODE) {
+    addr = "AP " + WiFi.softAPIP().toString();
+  } else if (WiFi.status() == WL_CONNECTED) {
+    addr = "IP " + WiFi.localIP().toString();
   } else {
-    switch (state) {
-      case UiState::BOOT:           line1 = FIRMWARE_NAME; break;
-      case UiState::WIFI_CONNECTING:line1 = "подключение к wifi..."; busyAnim = true; break; // a)
-      case UiState::AP_MODE:        line1 = "AP " + WiFi.softAPIP().toString(); break;      // b)
-      case UiState::CONNECTED:      line1 = "IP " + WiFi.localIP().toString(); break;       // c)
-      case UiState::RECEIVING:      line1 = "Загрузка данных"; busyAnim = true; break;      // d)
-      case UiState::PRINTING:       line1 = "печать..."; busyAnim = true; break;            // e)
-    }
+    String ap = WiFi.softAPIP().toString();
+    addr = (ap != "0.0.0.0") ? "AP " + ap : "IP " + WiFi.localIP().toString();
+  }
+
+  switch (state) {
+    case UiState::BOOT:            line1 = FIRMWARE_NAME; break;
+    case UiState::WIFI_CONNECTING: line1 = FIRMWARE_NAME; break;
+    case UiState::AP_MODE:         line1 = addr; break;                               // b)
+    case UiState::CONNECTED:       line1 = addr; break;                               // c)
+    case UiState::RECEIVING:       line1 = addr; busyAnim = true; break;              // d)
+    case UiState::PRINTING:        line1 = addr; busyAnim = true; break;              // e)
   }
 
   // --- line 1: 12px font, up to ~21 latin / ~10 cyrillic chars -------
@@ -84,25 +99,26 @@ void StatusDisplay::render() {
   }
   u8g2->drawUTF8(x, 12, line1.c_str());
 
-  // --- line 2: same 12px font as line 1 (user request), clipped to width
+  // --- line 2: same 12px font as line 1, one status line (user concept) --
   String line2;
-  if (state == UiState::CONNECTED) {
-    line2 = String(HOST_NAME_PREFIX) + ".local";   // no "mDNS:" prefix: the
-    // full host name barely fits 128 px as is; a prefix pushed it off-screen.
+  if (errorText.length()) {                        // g) transient errors first
+    line2 = errorText;
+  } else if (state == UiState::WIFI_CONNECTING || state == UiState::BOOT) {
+    line2 = "Подключение к WiFi...";               // a) join can take up to 20 s
   } else if (state == UiState::AP_MODE) {
-    line2 = "сеть не найдена";   // line 1 already shows the AP IP; repeating
-    // the setup URL below it was pure duplication - say WHY we are in AP.
-  } else if (state == UiState::RECEIVING || state == UiState::PRINTING) {
-    line2 = String(HOST_NAME_PREFIX) + " - " + lptStatusName(effective);
-  } else if (state == UiState::BOOT || state == UiState::WIFI_CONNECTING) {
-    line2 = "Подключение к WiFi...";   // boot: line 1 = firmware name, and
-    // the join can take up to 20 s - show what the box is doing meanwhile.
-  } else if (errorText.length() == 0
-          && (effective == LptStatus::OFFLINE || effective == LptStatus::UNKNOWN)) {
-    // UNKNOWN -> "принтер не подключен" (self-describing, no prefix);
-    // OFFLINE -> "принтер: офлайн"
-    line2 = (effective == LptStatus::UNKNOWN) ? String(lptStatusName(effective))
-                                              : "принтер: " + String(lptStatusName(effective));
+    line2 = "сеть не найдена";                     // why we are in AP mode
+  } else if (state == UiState::RECEIVING) {
+    line2 = "Загрузка данных";                     // d)
+  } else if (state == UiState::PRINTING) {
+    line2 = (effective == LptStatus::PAPER_OUT || effective == LptStatus::ERROR_STATE)
+              ? String(lptStatusName(effective))   // operator must intervene
+              : "печать...";                       // e)
+  } else if (effective == LptStatus::PAPER_OUT || effective == LptStatus::ERROR_STATE) {
+    line2 = lptStatusName(effective);              // f) "нет бумаги" / "ошибка принтера"
+  } else if (effective == LptStatus::OFFLINE || effective == LptStatus::UNKNOWN) {
+    line2 = "принтер не подключен";                // unwired / SELECT low
+  } else {
+    line2 = "готов";                               // connected + printer online
   }
   if (line2.length()) {
     u8g2->setFont(u8g2_font_6x12_t_cyrillic);          // same as line 1
