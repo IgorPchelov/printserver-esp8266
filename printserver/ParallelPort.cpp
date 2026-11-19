@@ -24,7 +24,7 @@ const char* lptStatusName(LptStatus s) {
     case LptStatus::BUSY:        return "занят";
     case LptStatus::PAPER_OUT:   return "нет бумаги";
     case LptStatus::OFFLINE:     return "офлайн";
-    case LptStatus::ERROR_STATE: return "ошибка";
+    case LptStatus::ERROR_STATE: return "ошибка принтера";
     case LptStatus::UNKNOWN:     return "принтер не подключен";
     default:                     return "принтер не подключен";
   }
@@ -43,6 +43,17 @@ void ParallelPort::begin() {
   pinMode(PIN_LPT_PE,     INPUT);
   pinMode(PIN_LPT_SELECT, INPUT);
   pinMode(PIN_LPT_ERROR,  INPUT);
+  // Keep unwired inputs at a defined level: a floating status line slowly
+  // drifts and can latch a phantom "ошибка" (ERROR pin reads LOW) hours
+  // into idle. The internal pulls are weak (~45k) and lose against the
+  // real printer's 5V-to-3.3V divider, so they only pin the floating
+  // case. Idle-safe levels per the wiring table: BUSY low, ACK high,
+  // PE low, SELECT low, ERROR high.
+  pinMode(PIN_LPT_BUSY,   INPUT_PULLDOWN);
+  pinMode(PIN_LPT_ACK,    INPUT_PULLUP);
+  pinMode(PIN_LPT_PE,     INPUT_PULLDOWN);
+  pinMode(PIN_LPT_SELECT, INPUT_PULLDOWN);
+  pinMode(PIN_LPT_ERROR,  INPUT_PULLUP);
 
   pinMode(PIN_LPT_INIT, OUTPUT);
   digitalWrite(PIN_LPT_INIT, HIGH);            // inactive (INIT is active-low)

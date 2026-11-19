@@ -228,6 +228,8 @@ void handleHttp(WiFiClient c) {
     if (b >= 0) pass = urlDecode(body.substring(b + 10));
     httpSend(c, "text/html; charset=utf-8", "<html><body>Подключение к " + ssid + "...</body></html>");
     delay(500);
+    display.setState(UiState::WIFI_CONNECTING);   // repaint before the blocking
+    display.tick();                               // connectTo() so the user sees it
     net.connectTo(ssid, pass);
     display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
   } else {
@@ -477,8 +479,11 @@ void handleIpp(WiFiClient c) {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  display.begin();
+  // WIFI_CONNECTING before display.begin(): begin() calls render() itself,
+  // so "ESP Print Server / Подключение к WiFi..." is on screen the moment
+  // the OLED is initialised - not only after the (blocking) net.begin().
   display.setState(UiState::WIFI_CONNECTING);
+  display.begin();
 
   LittleFS.begin(true);
   lpt.begin();
@@ -504,7 +509,9 @@ void setup() {
 
   lpt.onStatusChange = [](LptStatus s) {
     display.setPrinterStatus(s);
-    if (s == LptStatus::ERROR_STATE) display.setError("ошибка");
+    // "ошибка принтера" (not a bare "ошибка"): in AP mode the user thought
+    // the box itself / the WiFi was failing, while this is the LPT ERROR line.
+    if (s == LptStatus::ERROR_STATE) display.setError("ошибка принтера");
     else display.clearError();
   };
   Serial.println("boot ok: " + net.info());
