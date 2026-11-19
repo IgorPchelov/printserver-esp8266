@@ -1,107 +1,149 @@
-/*
-    This file is part of printserver-esp8266.
-
-    printserver-esp8266 is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    printserver-esp8266 is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with printserver-esp8266.  If not, see <http://www.gnu.org/licenses/>.
- */
-
+/* PrintQueue.cpp - see PrintQueue.h. Part of the GPLv3 port of printserver-esp8266. */
 #include "PrintQueue.h"
+#include "config.h"
 
-size_t PrintQueue::availableFlashSpace = 0;
-
-void PrintQueue::updateAvailableFlashSpace() {
-  FSInfo fsinfo;
-  SPIFFS.info(fsinfo);
-  availableFlashSpace = fsinfo.totalBytes - fsinfo.usedBytes;
+String PrintQueue::jobPath(uint32_t id, bool finalized) const {
+  String p = QUEUE_FILES_PREFIX;
+  p += id;
+  if (finalized) p += ".ok";
+  else p += ".tmp";
+  return p;
 }
 
-PrintQueue::PrintQueue(String _printerId) {
-  printerId = _printerId;
+void PrintQueue::begin() {
+  LittleFS.mkdir("/q");
+  cleanupStale();
+  rescan();
 }
 
-void PrintQueue::init() {
-  loadInfo();
-  updateAvailableFlashSpace();
-}
-
-void PrintQueue::saveInfo() {
-  File infoFile = SPIFFS.open(printerId, "w");
-  infoFile.write(head);
-  infoFile.write(tail);
-  infoFile.close();
-}
-
-void PrintQueue::loadInfo() {
-  if (SPIFFS.exists(printerId)) {
-    File infoFile = SPIFFS.open(printerId, "r");
-    head = infoFile.read();
-    tail = infoFile.read();
-    infoFile.close();
-  } else {
-    head = 0;
-    tail = 0;
+void PrintQueue::cleanupStale() {
+  File dir = LittleFS.open(QUEUE_FILES_PREFIX);
+  if (!dir || !dir.isDirectory()) return;
+  File f;
+  while ((f = dir.openNextFile())) {
+    String n = f.name();
+    f.close();
+    if (!n.startsWith("/") ) n = String(QUEUE_FILES_PREFIX) + n;
+    if (n.endsWith(".tmp")) {
+      LittleFS.remove(n);   // job never finalized: power loss mid-transfer
+    } else if (n.endsWith(".ok")) {
+      uint32_t id = (uint32_t) n.substring(n.lastIndexOf('/') + 1, n.length() - 3).toInt();
+      if (id >= nextId) nextId = id + 1;
+    }
   }
+  dir.close();
 }
 
-void PrintQueue::startJob(int clientId) {
-  head++;
-  fileWriters[clientId] = SPIFFS.open(printerId + String(head), "w");
-  saveInfo();
+void PrintQueue::rescan() {
+  pending = 0;
+  File dir = LittleFS.open(QUEUE_FILES_PREFIX);
+  if (!dir || !dir.isDirectory()) return;
+  File f;
+  while ((f = dir.openNextFile())) {
+    String n = f.name();
+    f.close();
+    if (!n.startsWith("/")) n = String(QUEUE_FILES_PREFIX) + n;
+    if (n.endsWith(".ok")) pending++;
+  }
+  dir.close();
+}
+
+bool PrintQueue::canStore() {
+  return (size_t)LittleFS.totalBytes() - (size_t)LittleFS.usedBytes() > QUEUE_FREE_MARGIN;
+}
+
+bool PrintQueue::startJob(int clientId) {
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS) return false;
+  if (writers[clientId]) writers[clientId].close();
+  String p = jobPath(nextId, false);
+  writers[clientId] = LittleFS.open(p, "w");
+  if (!writers[clientId]) return false;
+  writerIds[clientId] = nextId;
+  writerBytes[clientId] = 0;
+  nextId++;
+  return true;
+}
+
+void PrintQueue::markFormat(int clientId, bool pwgRaster) {
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS) return;
+  writerIsPwg[clientId] = pwgRaster;   // honored at endJob() via file extension
+}
+
+void PrintQueue::writeByte(int clientId, uint8_t b) {
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId]) return;
+  writers[clientId].write(b);
+  if (++writerBytes[clientId] % 4096 == 0) writers[clientId].flush();
+}
+
+void PrintQueue::write(int clientId, const uint8_t* buf, size_t len) {
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId] || !buf || !len) return;
+  writers[clientId].write(buf, len);
+  writerBytes[clientId] += len;
+  if (writerBytes[clientId] % 4096 < len) writers[clientId].flush();  // ~every 4 KB
 }
 
 void PrintQueue::endJob(int clientId, bool cancel) {
-  String fName = fileWriters[clientId].name();
-  fileWriters[clientId].close();
-  if (cancel) {
-    if(!SPIFFS.remove(fName)) {
-      Serial.println("Warning: failed to remove " + fName);
-    }
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId]) return;
+  uint32_t id = writerIds[clientId];
+  bool empty = writerBytes[clientId] == 0;
+  String tmp = jobPath(id, false);
+  writers[clientId].close();
+  writers[clientId] = File();
+  if (cancel || empty) {
+    LittleFS.remove(tmp);
   } else {
-    SPIFFS.rename(fName, fName + "OK");
+    // ".ok" = raw passthrough bytes; ".okw" = PWG raster (needs conversion)
+    LittleFS.rename(tmp, jobPath(id, true) + (writerIsPwg[clientId] ? "w" : ""));
+    pending++;
+    doneCount++;
+    writerIsPwg[clientId] = false;
   }
-}
-
-bool PrintQueue::canStoreByte() {
-  return availableFlashSpace > 4096; //4KiB margin
-}
-
-void PrintQueue::printByte(int clientId, byte b) {
-  fileWriters[clientId].write(b);
-  availableFlashSpace--;
 }
 
 bool PrintQueue::hasData() {
-  if (fileReader && fileReader.available() > 0) {
-    return true;
-  } else {
-    if (fileReader) {
-      String fName = fileReader.name();
-      fileReader.close();
-      if(!SPIFFS.remove(fName)) {
-        Serial.println("Warning: failed to remove " + fName);
-      }
+  if (reader && reader.available() > 0) return true;
+  if (reader) {
+    reader.close();
+    LittleFS.remove(jobPath(curId, true) + (curIsPwg ? "w" : ""));
+    pending--;
+  }
+  // find lowest finalized id >= 1
+  uint32_t best = 0;
+  File dir = LittleFS.open(QUEUE_FILES_PREFIX);
+  if (dir && dir.isDirectory()) {
+    File f;
+    while ((f = dir.openNextFile())) {
+      String n = f.name();
+      f.close();
+      if (!n.startsWith("/")) n = String(QUEUE_FILES_PREFIX) + n;
+      bool pwg = n.endsWith(".okw");
+      if (!pwg && !n.endsWith(".ok")) continue;
+      uint32_t id = (uint32_t) n.substring(n.lastIndexOf('/') + 1, n.length() - (pwg ? 4 : 3)).toInt();
+      if (id && (best == 0 || id < best)) { best = id; bestIsPwg = pwg; }
     }
-    if (head == tail || SPIFFS.exists(printerId + String(tail + 1))) {
-      return false;
-    } else {
-      tail++;
-      fileReader = SPIFFS.open(printerId + String(tail) + "OK", "r");
-      saveInfo();
-      return fileReader.available() > 0;
-    }
+    dir.close();
+  }
+  if (!best) return false;
+  curId = best;
+  curIsPwg = bestIsPwg;
+  reader = LittleFS.open(jobPath(best, true) + (curIsPwg ? "w" : ""), "r");
+  curSize = reader.size();
+  return reader && reader.available() > 0;
+}
+
+int PrintQueue::readByte() {
+  if (!reader || !reader.available()) return -1;
+  return reader.read();
+}
+
+void PrintQueue::dropCurrent() {
+  if (reader) {
+    reader.close();
+    LittleFS.remove(jobPath(curId, true) + (curIsPwg ? "w" : ""));
+    if (pending > 0) pending--;
   }
 }
 
-byte PrintQueue::readData() {
-  return fileReader.read();
+size_t PrintQueue::usedBytes() const {
+  return (size_t)LittleFS.usedBytes();
 }

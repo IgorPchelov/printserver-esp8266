@@ -1,2 +1,5 @@
 *~
 *.autosave
+printserver/.pio/
+printserver/tests/test_pwg
+printserver/tests/hdrsize

@@ -8,6 +8,20 @@ you need to update the [CH375-Arduino](https://github.com/gianluca-nitti/CH375-A
 
 # printserver-esp8266
 
+> **ESP32-S3 port on the `feature/esp32` branch.** This branch replaces the
+> ESP8266 firmware in `printserver/` with a full port to the
+> **ESP32-S3-DevKitC-1 N16R8** (16MB flash, 8MB PSRAM): direct LPT/Centronics
+> drive with all status lines (no shift register needed), OLED 0.91" status
+> display (Cyrillic), LittleFS spool queue with monotonic job IDs, Raw 9100,
+> IPP 1.1 (+ Android native printing via PWG-raster → PCL conversion), mDNS
+> `ESPPrint-XXXX.local`, web setup panel at `http://<ip>/wifi` with WiFi scan.
+> The flat file layout of the original project is kept (all sources next to
+> printserver.ino, no src/ subdirectory), so file history stays readable.
+> The bugfixes from PRs #1 (urlDecode) and #2 (credentials persist) are
+> carried over. See `printserver/README.md` (Russian) for wiring, build and
+> usage details; prebuilt binaries are in `printserver/firmware/`.
+> The original ESP8266 firmware remains available on the `master` branch.
+
 * This project allows you to use an ESP8266 as a Wi-Fi print server.
 * It works with the [IPP protocol](https://en.wikipedia.org/wiki/Internet_Printing_Protocol); the connected printers are accessible at `ipp://esp-ip-address:631/printer-name`, where the printer names can be configured in the `printserver/printserver.ino` file. By default, two printers are available, "parallel" which points to a real printer with the parallel port connected to the board's GPIOs and "serial" which prints the data to the serial UART (for debugging purposes).
 * The "AppSocket" or "HP JetDirect" protocol is also supported (on the TCP port 9100), but only for the first printer.

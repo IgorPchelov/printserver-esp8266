@@ -1,0 +1,155 @@
+/*
+ * ParallelPort.cpp - see ParallelPort.h
+ *
+ * This file is part of a port of gianluca-nitti/printserver-esp8266 (GPLv3).
+ */
+#include "ParallelPort.h"
+
+// DB25->GPIO map for the 8 data lines
+static const int DATA_PINS[8] = {
+  PIN_LPT_D0, PIN_LPT_D1, PIN_LPT_D2, PIN_LPT_D3,
+  PIN_LPT_D4, PIN_LPT_D5, PIN_LPT_D6, PIN_LPT_D7
+};
+
+// status line detection masks
+#define W_BUSY    0x01
+#define W_ACK     0x02
+#define W_PE      0x04
+#define W_SELECT  0x08
+#define W_ERROR   0x10
+
+const char* lptStatusName(LptStatus s) {
+  switch (s) {
+    case LptStatus::ONLINE:      return "готов";
+    case LptStatus::BUSY:        return "занят";
+    case LptStatus::PAPER_OUT:   return "нет бумаги";
+    case LptStatus::OFFLINE:     return "офлайн";
+    case LptStatus::ERROR_STATE: return "ошибка";
+    case LptStatus::UNKNOWN:     return "принтер не подключен";
+    default:                     return "принтер не подключен";
+  }
+}
+
+void ParallelPort::begin() {
+  for (int i = 0; i < 8; i++) {
+    pinMode(DATA_PINS[i], OUTPUT);
+    digitalWrite(DATA_PINS[i], LOW);
+  }
+  pinMode(PIN_LPT_STROBE, OUTPUT);
+  digitalWrite(PIN_LPT_STROBE, HIGH);          // idle (inactive, STROBE is active-low)
+
+  pinMode(PIN_LPT_BUSY,   INPUT);
+  pinMode(PIN_LPT_ACK,    INPUT);
+  pinMode(PIN_LPT_PE,     INPUT);
+  pinMode(PIN_LPT_SELECT, INPUT);
+  pinMode(PIN_LPT_ERROR,  INPUT);
+
+  pinMode(PIN_LPT_INIT, OUTPUT);
+  digitalWrite(PIN_LPT_INIT, HIGH);            // inactive (INIT is active-low)
+  pinMode(PIN_LPT_SELECTIN, OUTPUT);
+  digitalWrite(PIN_LPT_SELECTIN, LOW);         // asserted: host requests printer online
+  pinMode(PIN_LPT_AUTOFD, OUTPUT);
+  digitalWrite(PIN_LPT_AUTOFD, HIGH);          // inactive (no forced LF)
+
+  // Detect which status lines are physically wired: a line that never changes
+  // from its power-up floating level during 30 ms of sampling is considered
+  // floating. Floating inputs on ESP32-S3 usually read LOW (with GPIO47/48
+  // having internal pull-ups), so we treat a stuck line as "not wired" only
+  // if it also does not react to the printer being idle.
+  uint8_t seen = 0;
+  for (int i = 0; i < 30; i++) {
+    if (digitalRead(PIN_LPT_BUSY)   == HIGH) seen |= W_BUSY;   // BUSY high while idle is odd but record it
+    if (digitalRead(PIN_LPT_ACK)    == LOW)  seen |= W_ACK;
+    if (digitalRead(PIN_LPT_PE)     == HIGH) seen |= W_PE;
+    if (digitalRead(PIN_LPT_SELECT) == HIGH) seen |= W_SELECT;
+    if (digitalRead(PIN_LPT_ERROR)  == LOW)  seen |= W_ERROR;
+    delayMicroseconds(1000);
+  }
+  wiredMask = seen;
+
+  // Pull-up/down guidance: with divider resistors installed a missing printer
+  // must read: BUSY=LOW(=not busy), ACK=HIGH, PE=LOW, SELECT=LOW, ERROR=HIGH.
+  // We bias the perception: if SELECT is not high at boot -> printer offline or absent.
+  debStatus = rawStatus();
+}
+
+LptStatus ParallelPort::rawStatus() {
+  bool err  = (digitalRead(PIN_LPT_ERROR)  == LOW);
+  bool pe   = (digitalRead(PIN_LPT_PE)     == HIGH);
+  bool sel  = (digitalRead(PIN_LPT_SELECT) == HIGH);
+  bool busy = (digitalRead(PIN_LPT_BUSY)   == HIGH);
+  lastBusy = busy; lastPe = pe; lastSelect = sel; lastError = err;
+  if (err)            return LptStatus::ERROR_STATE;
+  if (pe)             return LptStatus::PAPER_OUT;
+  if (!sel)           return LptStatus::OFFLINE;
+  if (busy)           return LptStatus::BUSY;
+  return LptStatus::ONLINE;
+}
+
+bool ParallelPort::isAccepting() {
+  return digitalRead(PIN_LPT_BUSY)   == LOW
+      && digitalRead(PIN_LPT_SELECT) == HIGH
+      && digitalRead(PIN_LPT_ERROR)  == HIGH
+      && digitalRead(PIN_LPT_PE)     == LOW;
+}
+
+bool ParallelPort::ackSeen() {
+  bool f = ackFlag;
+  ackFlag = false;
+  return f;
+}
+
+void ParallelPort::resetPrinter() {
+  digitalWrite(PIN_LPT_INIT, LOW);
+  delayMicroseconds(100);            // printer needs >= 50 us (IEEE 1284)
+  digitalWrite(PIN_LPT_INIT, HIGH);
+  delay(10);                          // printer re-initialises its I/F
+}
+
+bool ParallelPort::writeByte(uint8_t b, uint32_t timeoutMs) {
+  uint32_t start = millis();
+
+  // wait for ready (BUSY low, not error/paper-out/offline)
+  while (!isAccepting()) {
+    if (millis() - start > timeoutMs) return false;
+    if (digitalRead(PIN_LPT_ERROR) == LOW || digitalRead(PIN_LPT_PE) == HIGH) return false;
+    delayMicroseconds(20);
+  }
+
+  // put data on the bus, respect setup time
+  for (int i = 0; i < 8; i++) digitalWrite(DATA_PINS[i], (b >> i) & 1);
+  delayMicroseconds(T_DS_SETUP_US);
+
+  // STROBE low pulse
+  digitalWrite(PIN_LPT_STROBE, LOW);
+  delayMicroseconds(T_STROBE_LOW_US);
+  digitalWrite(PIN_LPT_STROBE, HIGH);
+
+  // The printer raises BUSY within ~0.5 us of accepting; it clears BUSY and
+  // pulses ACK when the byte is stored. Wait for BUSY to *fall back* (or
+  // ACK pulse) so the next writeByte cannot overrun the printer's buffer.
+  uint32_t tAccept = millis();
+  bool sawBusy = false;
+  while (true) {
+    bool busy = digitalRead(PIN_LPT_BUSY) == HIGH;
+    if (busy) sawBusy = true;
+    if (digitalRead(PIN_LPT_ACK) == LOW) ackFlag = true;   // ACK is a low pulse; sample-level detect
+    if (sawBusy && !busy) break;                            // BUSY rose and fell: accepted
+    if (!sawBusy && digitalRead(PIN_LPT_ACK) == LOW) break; // very fast printer: ACK already
+    if (millis() - tAccept > 10) break;                     // printers pulse BUSY per byte; 10 ms is plenty
+    if (millis() - start > timeoutMs) return false;
+  }
+  return true;
+}
+
+void ParallelPort::poll() {
+  LptStatus s = rawStatus();
+  if (s != debStatus) {
+    debStatus = s;
+    if (onStatusChange) onStatusChange(s);
+  }
+}
+
+LptStatus ParallelPort::status() {
+  return debStatus;
+}
