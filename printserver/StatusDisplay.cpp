@@ -5,6 +5,7 @@
  */
 #include "StatusDisplay.h"
 #include "ParallelPort.h"
+#include "NetService.h"      // joiningSsid(): target SSID while the link is still down
 
 void StatusDisplay::begin() {
   u8g2 = new U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C(U8G2_R0, PIN_OLED_SCL, PIN_OLED_SDA, U8X8_PIN_NONE);
@@ -104,7 +105,14 @@ void StatusDisplay::render() {
   if (errorText.length()) {                        // g) transient errors first
     line2 = errorText;
   } else if (state == UiState::WIFI_CONNECTING || state == UiState::BOOT) {
-    line2 = "Подключение к WiFi...";               // a) join can take up to 20 s
+    // "Подкл. к ХХХ" (user request): the SSID we are trying to join, straight
+    // from the STA configuration (WiFi.SSID() stays empty until the link is
+    // actually up, so it cannot be used here). Known SSID -> "Подкл. к
+    // HomeWiFi..."; unknown/empty (blank first-boot config) -> the generic
+    // "Подключение к WiFi...".
+    String ssid = NetService::joiningSsid();
+    line2 = ssid.length() ? "Подкл. к " + ssid + "..." : "Подключение к WiFi...";
+                                        // a) join can take up to 20 s
   } else if (state == UiState::AP_MODE) {
     line2 = "сеть не найдена";                     // why we are in AP mode
   } else if (state == UiState::RECEIVING) {

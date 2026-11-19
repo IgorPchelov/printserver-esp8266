@@ -140,6 +140,26 @@ public:
 };
 EOF
 
+cat > "$OUT/fake/esp_wifi.h" <<'EOF'
+// minimal esp_wifi stub: esp_wifi_get_config (STA config) + wifi_config_t
+#pragma once
+#include <cstdint>
+#include <cstring>
+typedef enum { ESP_OK = 0 } esp_err_t;
+typedef enum { WIFI_IF_STA = 0, WIFI_IF_AP = 1 } wifi_interface_t;
+typedef struct {
+  uint8_t ssid[33];
+  uint8_t password[65];
+} wifi_sta_config_t;
+typedef union {
+  wifi_sta_config_t sta;
+} wifi_config_t;
+inline esp_err_t esp_wifi_get_config(wifi_interface_t, wifi_config_t* out) {
+  memset(out, 0, sizeof(*out));
+  return ESP_OK;
+}
+EOF
+
 cat > "$OUT/fake/WiFi.h" <<'EOF'
 // minimal WiFi stub
 #pragma once
@@ -186,6 +206,10 @@ public:
   bool softAPdisconnect(bool) { return true; }
   void persistent(bool) {}
   int16_t scanNetworks(bool) { return 0; }
+  // full ESP32 signature: async, show_hidden, passive, max_ms_per_chan,
+  // ... (defaults for the rest)
+  int16_t scanNetworks(bool, bool, bool, uint16_t) { return 0; }
+  bool disconnect() { return true; }
   int16_t scanComplete() { return 0; }
   void scanDelete() {}
   String SSID() { return "net"; }

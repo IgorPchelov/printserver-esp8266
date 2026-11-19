@@ -82,6 +82,12 @@
 #define LPD_PORT          515    // RFC 1179 Line Printer Daemon
 #define AP_PASSWORD       ""     // open AP by default; set via web panel
 #define WIFI_STA_TIMEOUT_MS 20000UL
+#define SCAN_TIMEOUT_MS     15000UL  // /scan watchdog: a stuck async scan must not
+                                     // leave the page spinning on "Поиск сетей..."
+#define AP_RETRY_MS         120000UL // AP mode: retry the stored network this often
+                                     // (self-heal when the router comes back)
+#define AP_RETRY_TIMEOUT_MS 10000UL  // give each background retry this long before
+                                     // returning the radio to clean AP duty
 #define MDNS_TTL          120
 
 // ---------------------------------------------------------------- Print queue (LittleFS)

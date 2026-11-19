@@ -4,7 +4,9 @@
  * Layout concept (user): line 1 = connectivity only - firmware name at
  * boot / while joining WiFi, station IP once connected, AP IP while in
  * setup mode. Line 2 = what is going on / printer state:
- *   a) "Подключение к WiFi..." while joining a network
+ *   a) "Подкл. к ХХХ..."      while joining network XXX (generic
+ *                              "Подключение к WiFi..." when the SSID is
+ *                              unknown, e.g. blank first-boot config)
  *   b) "сеть не найдена"       why we are in access-point mode
  *   c) "готов"                 connected + printer online
  *   d) "Загрузка данных"       while receiving a print job

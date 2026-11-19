@@ -81,6 +81,8 @@ bool pwgOut(void*, uint8_t b) {
 }
 
 void processQueue() {
+  net.setBusy(engState != EngineState::IDLE);   // defer AP->STA switchover while a
+                                                // job is in flight (it would die)
   if (engState == EngineState::RECEIVING) return;    // spool first
   if (engState == EngineState::IDLE && queue.hasData()) {
     engState = EngineState::PRINTING;
@@ -204,8 +206,8 @@ void handleHttp(WiFiClient c) {
     httpSend(c, "text/html; charset=utf-8", body);
   } else if (method == "GET" && path == "/scan") {
     // Wi-Fi scan endpoint for the /wifi page. First call kicks an async
-    // scan (~2-3 s) and reports busy; the page polls every second until
-    // results (or an error) come back.
+    // scan (~1.6 s with the fast 120 ms/channel timing) and reports busy;
+    // the page polls every second until results (or an error) come back.
     String json;
     int st = net.scanStatus();
     if (st == -1) {                       // still scanning
@@ -216,7 +218,7 @@ void handleHttp(WiFiClient c) {
     } else if (st == -2) {                // scan failed
       json = "[]";
     } else {
-      json = net.scanJson();              // st = number of results
+      json = net.scanJson();              // st == 1: results ready (possibly 0)
     }
     httpSend(c, "application/json", json);
   } else if (method == "POST" && path == "/wifi-connect") {
@@ -230,7 +232,7 @@ void handleHttp(WiFiClient c) {
     delay(500);
     display.setState(UiState::WIFI_CONNECTING);   // repaint before the blocking
     display.tick();                               // connectTo() so the user sees it
-    net.connectTo(ssid, pass);
+    net.connectTo(ssid, pass, [] { lpt.poll(); display.tick(); delay(1); });
     display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
   } else {
     c.printf("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
@@ -480,15 +482,16 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   // WIFI_CONNECTING before display.begin(): begin() calls render() itself,
-  // so "ESP Print Server / Подключение к WiFi..." is on screen the moment
-  // the OLED is initialised - not only after the (blocking) net.begin().
+  // so "ESP Print Server / Подкл. к ХХХ" is on screen the moment the OLED is
+  // initialised - not only after the (blocking) net.begin().
   display.setState(UiState::WIFI_CONNECTING);
   display.begin();
 
   LittleFS.begin(true);
   lpt.begin();
   queue.begin();
-  net.begin();
+  net.begin();                           // non-blocking join with stored credentials
+  net.waitConnected([] { lpt.poll(); display.tick(); delay(1); });
   display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
 
   rawServer.begin();
@@ -521,9 +524,16 @@ void setup() {
 }
 
 void loop() {
+  bool wasAp = net.isAp();
   net.tick();
   lpt.poll();
   display.tick();
+
+  // self-heal made visible: when the supervised AP retry joined the router,
+  // refresh the display state (IP line + "готов") instead of showing stale
+  // AP info until the next print job
+  if (wasAp != net.isAp())
+    display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
 
   // raw 9100 accept + pump
   WiFiClient nc = rawServer.accept();
