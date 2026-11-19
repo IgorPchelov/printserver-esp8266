@@ -10,6 +10,8 @@
  *   f) "нет бумаги"            when PE is asserted
  *   g) "ошибка"                on printer/hardware errors
  * plus a small activity icon and mDNS name hint on the second line.
+ * In AP mode the second line is prefixed with a 12x12 gear icon (XBM)
+ * instead of the "setup: " word - keeps the URL from scrolling.
  *
  * This file is part of a port of gianluca-nitti/printserver-esp8266 (GPLv3).
  */
