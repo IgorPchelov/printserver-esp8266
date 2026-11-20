@@ -96,6 +96,7 @@ inline void yield() {}
 inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
 inline int digitalRead(int) { return 1; }
+inline void neopixelWrite(int, uint8_t, uint8_t, uint8_t) {}   // WS2812 (StatusLed)
 #define INPUT 0x1
 #define OUTPUT 0x3
 #define INPUT_PULLUP 0x5
@@ -282,12 +283,12 @@ MDNSResponder MDNS;
 FSClass LittleFS;
 EOF
 
-for f in StatusDisplay ParallelPort NetService; do
+for f in StatusDisplay StatusLed ParallelPort NetService; do
   echo "=== $f.cpp"
   g++ -std=c++17 -fsyntax-only -I printserver -I "$OUT/fake" printserver/$f.cpp
 done
 echo "=== printserver.ino (as C++)"
 cp printserver/printserver.ino "$OUT/fake/printserver_ino.cpp"
 g++ -std=c++17 -fsyntax-only -I printserver -I "$OUT/fake" "$OUT/fake/printserver_ino.cpp"
-echo "SYNTAX OK (all 4 files)"
+echo "SYNTAX OK (all 5 files)"
 rm -rf "$OUT"

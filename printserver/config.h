@@ -62,12 +62,23 @@
 #define OLED_H            32
 
 // ---------------------------------------------------------------- Button
-#define PIN_BTN           1   // BOOT button on DevKitC-1; long press = AP mode
+// BOOT button of the ESP32-S3-DevKitC-1 (wired to GPIO0). Hold it while
+// powering on - or any time later - to force the configuration AP.
+#define PIN_BTN           0   // BOOT button on DevKitC-1 (GPIO0, has external pull-up)
+#define BTN_HOLD_MS       3000UL  // hold this long to force AP mode
 
 // ---------------------------------------------------------------- LEDs
-#define PIN_LED_WIFI      2   // DevKitC-1 RGB LED is on GPIOs 38/47/48 on some
-                              // revisions - we keep the onboard RGB unused and
-                              // use a simple external LED on GPIO2 if wired.
+// Status indication that does not depend on the OLED (user request: the
+// box must stay readable even with a dead/unfitted display).
+#define PIN_LED_RGB       48  // onboard WS2812 RGB LED of the DevKitC-1: GPIO48
+                              // on N16R8 boards (octal PSRAM, the boards this
+                              // project targets). On quad-PSRAM revisions the
+                              // RGB sits on GPIO38 - unusable here, that pin
+                              // drives LPT INIT. 255 = no WS2812 fitted.
+#define PIN_LED_WIFI      2   // optional simple LED (anode to GPIO2 via ~470R,
+                              // cathode to GND), mirrors the RGB patterns as
+                              // on/off blinks; 255 = not wired. Kept for the
+                              // original wiring docs of this project.
 
 // ---------------------------------------------------------------- Timings (microseconds) - IEEE 1284 compatibility mode
 #define T_DS_SETUP_US     1    // data setup before STROBE falling (>=0.5 us)

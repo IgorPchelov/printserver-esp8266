@@ -26,6 +26,10 @@ public:
   String scanJson();            // results as [{ssid,rssi,sec},...] (clears them)
   void setBusy(bool b) { busy = b; }  // app is receiving/printing: defer the AP->STA
                                       // switchover (it would kill the job in flight)
+  void forceAp();                // user asked for it (button): drop the STA link and
+                                 // open the configuration AP immediately; no background
+                                 // retries while the user is in the setup page
+  static bool isForcedAp() { return forcedAp; }  // "сеть не найдена" vs "настройка" on the OLED
   void tick();                  // reconnect supervision
   static String hostName();     // ESPPrint-XXXX
 private:
@@ -38,6 +42,10 @@ private:
   uint32_t apRetryStart = 0;    // when that retry was kicked
   bool promotePending = false;  // retry joined OK, waiting for an idle moment
                                 // to tear the AP down (job in flight)
+  static bool forcedAp;         // AP opened by the user (button): retry loop
+                                // must stay off until new credentials are saved.
+                                // Static: the OLED renderer asks NetService::
+                                // isForcedAp() without needing the net object.
   bool busy = false;            // mirrored from the app via setBusy()
   uint32_t apLastRetry = 0;     // last retry time (cadence: AP_RETRY_MS)
   uint32_t lastCheck = 0;

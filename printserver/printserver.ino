@@ -31,12 +31,14 @@
 #include "config.h"
 #include "ParallelPort.h"
 #include "StatusDisplay.h"
+#include "StatusLed.h"
 #include "PrintQueue.h"
 #include "NetService.h"
 #include "PwgToPcl.h"
 
 ParallelPort lpt;
 StatusDisplay display;
+StatusLed led;
 PrintQueue queue;
 NetService net;
 
@@ -67,6 +69,34 @@ void feedByteToLpt(uint8_t b) {
     display.setError("ошибка LPT");
     engState = EngineState::IDLE;
   }
+}
+
+// ---- BOOT button: hold BTN_HOLD_MS to force the configuration AP --------
+// Polled in loop() and in the blocking-connect pumps (net.waitConnected /
+// net.connectTo), so the button also works while the box is stuck joining
+// a bad network - exactly when the user needs it most.
+uint32_t btnDownSince = 0;          // 0 = not pressed
+void pollButton() {
+  if (digitalRead(PIN_BTN) == LOW) {          // pressed (button pulls GPIO0 low)
+    if (!btnDownSince) btnDownSince = millis();
+    if (millis() - btnDownSince >= BTN_HOLD_MS && !net.isForcedAp()) {
+      Serial.println("[btn] long press -> forcing configuration AP");
+      net.forceAp();                          // STA down, AP up, retries off
+      display.setState(UiState::AP_MODE);     // line 2 says "настройка" (not
+      led.setMode(UiState::AP_MODE);          // "сеть не найдена") via isForcedAp()
+      btnDownSince = millis();                // debounce: re-arm after firing
+    }
+  } else {
+    btnDownSince = 0;
+  }
+}
+
+// Keep LED and OLED telling the same story: call wherever the UiState or
+// the printer-attention condition changes.
+void syncLed() {
+  led.setMode(display.uiState());
+  led.setAttention(lpt.status() == LptStatus::PAPER_OUT ||
+                   lpt.status() == LptStatus::ERROR_STATE);
 }
 
 // ---- PWG->PCL conversion state (active when queue.currentJobIsPwg()) ----
@@ -232,7 +262,7 @@ void handleHttp(WiFiClient c) {
     delay(500);
     display.setState(UiState::WIFI_CONNECTING);   // repaint before the blocking
     display.tick();                               // connectTo() so the user sees it
-    net.connectTo(ssid, pass, [] { lpt.poll(); display.tick(); delay(1); });
+    net.connectTo(ssid, pass, [] { lpt.poll(); display.tick(); syncLed(); led.tick(); pollButton(); delay(1); });
     display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
   } else {
     c.printf("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
@@ -486,12 +516,14 @@ void setup() {
   // initialised - not only after the (blocking) net.begin().
   display.setState(UiState::WIFI_CONNECTING);
   display.begin();
+  led.begin();                            // status LED mirrors the OLED from now on
+  pinMode(PIN_BTN, INPUT_PULLUP);         // BOOT button: hold = configuration AP
 
   LittleFS.begin(true);
   lpt.begin();
   queue.begin();
   net.begin();                           // non-blocking join with stored credentials
-  net.waitConnected([] { lpt.poll(); display.tick(); delay(1); });
+  net.waitConnected([] { lpt.poll(); display.tick(); syncLed(); led.tick(); pollButton(); delay(1); });
   display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
 
   rawServer.begin();
@@ -528,6 +560,9 @@ void loop() {
   net.tick();
   lpt.poll();
   display.tick();
+  pollButton();                           // BOOT hold: force AP (works while joining too)
+  syncLed();                              // LED mirrors the OLED state + printer attention
+  led.tick();
 
   // self-heal made visible: when the supervised AP retry joined the router,
   // refresh the display state (IP line + "готов") instead of showing stale

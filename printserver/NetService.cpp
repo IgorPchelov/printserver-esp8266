@@ -4,6 +4,8 @@
                                         // the only reliable source of "which SSID
                                         // are we joining" BEFORE the link is up
 
+bool NetService::forcedAp = false;      // static: see NetService.h
+
 String urlDecode(String str) {          // PR #29 (user's fix): %XX and '+' handling
   String decoded = "";
   decoded.reserve(str.length());
@@ -82,6 +84,7 @@ void NetService::startAp() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ssid.c_str(), AP_PASSWORD);
   apMode = true;
+  promotePending = false;                // any AP (re)start cancels a pending promote
   apLastRetry = millis();
 }
 
@@ -91,6 +94,9 @@ String NetService::hostName() {
 
 void NetService::connectTo(const String& ssid, const String& pass, void (*pump)()) {
   if (apMode) { WiFi.softAPdisconnect(true); apMode = false; }
+  forcedAp = false;                       // new credentials saved: back to normal duty
+  apRetryActive = false;
+  promotePending = false;
   WiFi.persistent(true);                 // PR #31 (user's fix): save credentials
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostName().c_str());
@@ -109,6 +115,17 @@ void NetService::connectTo(const String& ssid, const String& pass, void (*pump)(
 
 String NetService::ip() const {
   return apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+}
+
+void NetService::forceAp() {
+  // Button-requested configuration AP. Different from the fallback AP:
+  // the retry loop must stay off (the user deliberately left the home
+  // network; hammering the stored one every 2 min would fight their new
+  // choice) until new credentials are saved via connectTo().
+  forcedAp = true;
+  apRetryActive = false;
+  promotePending = false;
+  startAp();
 }
 
 // ---- Wi-Fi scan (for the /wifi web page) ------------------------------
@@ -187,18 +204,22 @@ void NetService::tick() {
   if (scanRunning) return;
 
   if (apMode) {
+    // forced AP (button): the user deliberately left the home network - no
+    // retries, no switchover, until new credentials arrive via connectTo()
+    if (forcedAp) return;
+
     // 2) Supervise an in-flight stored-network retry (non-blocking, see
     //    below): success promotes us to STA-only, failure goes back to AP
     //    duty without the radio hunting in the background.
     if (apRetryActive) {
       if (WiFi.status() == WL_CONNECTED) {
         apRetryActive = false;
-        promotePending = true;            // joined OK - tear the AP down at the
-                                          // next idle moment (a job arriving over
-                                          // the AP must not die mid-page)
+        promotePending = true;              // joined OK - tear the AP down at the
+                                            // next idle moment (a job arriving over
+                                            // the AP must not die mid-page)
       } else if (now - apRetryStart > AP_RETRY_TIMEOUT_MS) {
         apRetryActive = false;
-        WiFi.disconnect();               // stop the hunt, back to clean AP duty
+        WiFi.disconnect();                  // stop the hunt, back to clean AP duty
       }
       return;
     }
@@ -221,7 +242,7 @@ void NetService::tick() {
       if (haveStored) {
         apRetryActive = true;
         apRetryStart = now;
-        WiFi.begin();                    // stored credentials, non-blocking
+        WiFi.begin();                       // stored credentials, non-blocking
       }
     }
     return;

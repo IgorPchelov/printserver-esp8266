@@ -41,6 +41,7 @@ class StatusDisplay {
 public:
   void begin();
   void setState(UiState s);          // network/job driven state
+  UiState uiState() const { return state; }   // for StatusLed: LED mirrors the OLED
   void setError(const String& e);    // transient error text (g)
   void clearError();
   void setPrinterStatus(LptStatus s);// reflects LPT lines (f/g handled here too)
