@@ -47,6 +47,11 @@ public:
   void setPrinterStatus(LptStatus s);// reflects LPT lines (f/g handled here too)
   void tick();                       // periodic refresh, animations
   void off();                        // display off (power save)
+
+  // Horizontal draw offset for a line wider than the 128 px viewport.
+  // Pure function (host-testable, see tests/test_scroll.cpp): a triangle
+  // wave that sweeps left to -(w-128)-16, dwells, and sweeps back.
+  static int16_t scrollShift(uint16_t w, uint32_t frame);
 private:
   U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C* u8g2 = nullptr;
   UiState state = UiState::BOOT;
@@ -54,7 +59,10 @@ private:
   String errorText = "";
   uint32_t errorUntil = 0;           // millis() when errorText auto-expires
   uint32_t lastDraw = 0;
-  uint8_t animFrame = 0;
+  // 32-bit so the scroll triangle completes its cycle even for wide lines:
+  // the old uint8_t counter wrapped at 128 half-steps, before a ~200 px line
+  // ever finished its sweep (see scrollShift in the .cpp).
+  uint32_t animFrame = 0;
   bool dirty = true;
   void render();
 };

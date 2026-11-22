@@ -90,6 +90,9 @@
 #define HTTP_PORT         80
 #define IPP_PORT          631
 #define RAW_PORT          9100   // JetDirect / AppSocket
+#define RAW_IDLE_TIMEOUT_MS 300000UL // raw client silent this long = dead (half-open
+                                     // TCP / crashed sender): drop its spool job and
+                                     // free the slot. Healthy streams never pause 5 min.
 #define LPD_PORT          515    // RFC 1179 Line Printer Daemon
 #define AP_PASSWORD       ""     // open AP by default; set via web panel
 #define WIFI_STA_TIMEOUT_MS 20000UL

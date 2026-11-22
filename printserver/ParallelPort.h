@@ -50,6 +50,13 @@ public:
   // Which status lines were actually detected at boot (for diagnostics)
   bool lineWired(uint8_t mask) const { return (wiredMask & mask) != 0; }
 
+  // True once the SELECT line has ever been driven high (a real printer
+  // asserted it at least once since boot - the self-healing mask in poll()
+  // keeps it sticky). Distinguishes "printer connected but deselected"
+  // (power off / offline button: pause the job and wait) from "nothing on
+  // the port" (fail fast, drop with an honest error - do not stall).
+  bool selectEverWired() const;
+
   // Raw line snapshot (true = active assertion, already polarity-normalized)
   bool rawBusy()   const { return lastBusy; }
   bool rawPe()     const { return lastPe; }

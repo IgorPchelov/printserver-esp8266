@@ -1,9 +1,11 @@
 #!/bin/sh
 # Host unit tests (no hardware needed)
-#   test_pwg  - PWG-raster -> PCL converter (PwgToPcl.h)
+#   test_pwg   - PWG-raster -> PCL converter (PwgToPcl.h)
 #   test_queue - spool queue logic (PrintQueue.cpp) on a REAL littlefs
 #                in RAM (host_littlefs/ shim, littlefs v2.9 vendored)
-#   syntax    - g++ -fsyntax-only of every firmware module via stubs
+#   test_scroll- OLED ping-pong scroll trajectory (StatusDisplay.cpp linked
+#                against the host_syntax stubs)
+#   syntax     - g++ -fsyntax-only of every firmware module via stubs
 #                (host_syntax/), so .ino edits are compile-checked too
 cd "$(dirname "$0")"
 rc=0
@@ -17,6 +19,12 @@ g++ -std=c++17 -w -I. -Ihost_littlefs -o test_queue \
     -x c host_littlefs/littlefs/lfs.c \
     -x c host_littlefs/littlefs/lfs_util.c -x none && ./test_queue 2>&1 \
     | grep -v "littlefs/lfs.c:.*error:" || rc=1
+
+echo "== OLED scroll trajectory tests =="
+g++ -std=c++17 -w -I. -I.. -Ihost_syntax/stubs -o test_scroll \
+    test_scroll.cpp ../StatusDisplay.cpp ../ParallelPort.cpp \
+    ../NetService.cpp host_syntax/stubs/stub_globals.cpp && \
+    ./test_scroll || rc=1
 
 echo "== firmware syntax check =="
 for f in printserver.ino ParallelPort.cpp PrintQueue.cpp NetService.cpp \

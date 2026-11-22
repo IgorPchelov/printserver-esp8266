@@ -4,3 +4,4 @@ printserver/.pio/
 printserver/tests/test_pwg
 printserver/tests/hdrsize
 printserver/tests/test_queue
+printserver/tests/test_scroll

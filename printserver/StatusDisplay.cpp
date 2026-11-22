@@ -7,6 +7,21 @@
 #include "ParallelPort.h"
 #include "NetService.h"      // joiningSsid(), isForcedAp(): wifi state the OLED shows
 
+// Triangle-wave scroll offset for a line wider than the 128 px viewport.
+// One period = 2*span half-steps: sweep left to -span (= -(w-128) minus a
+// 16 px dwell margin that shows the line's END clearly before reversing),
+// then sweep back to 0. The old formula folded the second half of the
+// period at shift>16, so long lines drifted 16 px left, JUMPED to the far
+// end and crawled back - the left sweep never happened; the uint8_t frame
+// counter additionally wrapped before wide lines completed one cycle.
+int16_t StatusDisplay::scrollShift(uint16_t w, uint32_t frame) {
+  if (w <= 128) return 0;
+  const uint32_t span = (uint32_t)w - 128 + 16;
+  uint32_t t = (frame / 2) % (2 * span);
+  int16_t shift = (t < span) ? (int16_t)t : (int16_t)(2 * span - t);
+  return -shift;
+}
+
 void StatusDisplay::begin() {
   u8g2 = new U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C(U8G2_R0, PIN_OLED_SCL, PIN_OLED_SDA, U8X8_PIN_NONE);
   u8g2->setI2CAddress(OLED_ADDR << 1);
@@ -91,13 +106,7 @@ void StatusDisplay::render() {
   // --- line 1: 12px font, up to ~21 latin / ~10 cyrillic chars -------
   u8g2->setFont(u8g2_font_6x12_t_cyrillic);
   uint16_t w = u8g2->getUTF8Width(line1.c_str());
-  int16_t x = 0;
-  if (w > 128) {
-    // scroll long text slowly
-    int16_t shift = (animFrame / 2) % (w - 128 + 16);
-    if (shift > 16) shift = (w + 16 - 128) - shift; // ping-pong
-    x = -shift;
-  }
+  int16_t x = scrollShift(w, animFrame);
   u8g2->drawUTF8(x, 12, line1.c_str());
 
   // --- line 2: same 12px font as line 1, one status line (user concept) --
@@ -118,9 +127,10 @@ void StatusDisplay::render() {
   } else if (state == UiState::RECEIVING) {
     line2 = "Загрузка данных";                     // d)
   } else if (state == UiState::PRINTING) {
-    line2 = (effective == LptStatus::PAPER_OUT || effective == LptStatus::ERROR_STATE)
+    line2 = (effective == LptStatus::PAPER_OUT || effective == LptStatus::ERROR_STATE ||
+             effective == LptStatus::OFFLINE)
               ? String(lptStatusName(effective))   // operator must intervene
-              : "печать...";                       // e)
+              : "печать...";                       // e) (OFFLINE = paused, waiting for the printer)
   } else if (effective == LptStatus::PAPER_OUT || effective == LptStatus::ERROR_STATE) {
     line2 = lptStatusName(effective);              // f) "нет бумаги" / "ошибка принтера"
   } else if (effective == LptStatus::OFFLINE || effective == LptStatus::UNKNOWN) {
@@ -131,14 +141,7 @@ void StatusDisplay::render() {
   if (line2.length()) {
     u8g2->setFont(u8g2_font_6x12_t_cyrillic);          // same as line 1
     uint16_t w2 = u8g2->getUTF8Width(line2.c_str());
-    int16_t x2 = 0;
-    if (w2 > 128) {
-      // too wide even without a prefix (long host name): ping-pong scroll,
-      // same as line 1, so the full value stays readable
-      int16_t shift = (animFrame / 2) % (w2 - 128 + 16);
-      if (shift > 16) shift = (w2 + 16 - 128) - shift;
-      x2 = -shift;
-    }
+    int16_t x2 = scrollShift(w2, animFrame);            // ping-pong, same as line 1
     u8g2->drawUTF8(x2, 27, line2.c_str());             // baseline 27 keeps 12px glyphs inside 32px
   }
 

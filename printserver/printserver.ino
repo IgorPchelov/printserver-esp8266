@@ -13,6 +13,8 @@
 
     You should have received a copy of the GNU General Public License
     along with printserver-esp8266.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 /*
   * printserver.ino - ESP32-S3 generic LPT/Centronics WiFi print server.
   * Port of gianluca-nitti/printserver-esp8266 (GPLv3), heavily reworked.
@@ -52,6 +54,11 @@ NetService net;
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClients[MAX_RAW_CLIENTS];
 bool rawActive[MAX_RAW_CLIENTS];
+// last time each raw slot saw a byte. A slot whose client goes silent for
+// RAW_IDLE_TIMEOUT_MS (crashed sender / half-open TCP that never FINs) is
+// reaped below - without this, four such ghosts wedge every slot and the
+// box stops accepting jobs until rebooted.
+uint32_t rawLastByte[MAX_RAW_CLIENTS] = {0};
 
 // ---------------- HTTP (status + wifi setup) ----------------
 WiFiServer httpServer(HTTP_PORT);
@@ -96,12 +103,14 @@ void pollButton() {
   if (digitalRead(PIN_BTN) == LOW) {          // pressed (button pulls GPIO0 low)
     if (!btnDownSince) btnDownSince = millis();
     if (millis() - btnDownSince >= BTN_HOLD_MS && !net.isForcedAp()) {
+      // fires once per hold: forceAp() sets the static forcedAp flag, and
+      // the !isForcedAp() guard above keeps it from re-firing while held.
+      // It re-arms for the next hold after new credentials are saved
+      // (connectTo() clears the flag) or after a reboot.
       Serial.println("[btn] long press -> forcing configuration AP");
       net.forceAp();                          // STA down, AP up, retries off
       display.setState(UiState::AP_MODE);     // line 2 says "настройка" (not
       led.setMode(UiState::AP_MODE);          // "сеть не найдена") via isForcedAp()
-      btnDownSince = millis() - BTN_HOLD_MS + 500;   // re-arm: fire again every
-                                                     // 0.5 s while still held
     }
   } else {
     btnDownSince = 0;
@@ -168,8 +177,19 @@ void processQueue() {
     engineSwitchJob();                            // converters for job #1
   }
   if (engState == EngineState::PRINTING) {
-    if (LptStatus st = lpt.status(); st == LptStatus::PAPER_OUT || st == LptStatus::ERROR_STATE) {
+    LptStatus st = lpt.status();
+    if (st == LptStatus::PAPER_OUT || st == LptStatus::ERROR_STATE) {
       display.setPrinterStatus(st);      // keep job, wait for operator
+      return;
+    }
+    // Printer KNOWN to be connected (SELECT driven high at least once) but
+    // deselected right now (powered off / offline button): hold the job and
+    // wait - the moment poll() sees SELECT high again, printing resumes from
+    // exactly this byte. A port where SELECT never asserted (nothing wired)
+    // does NOT pause here: writeByte fails fast (~1 s) and the job drops
+    // with "нет ответа LPT" instead of silently piling up forever.
+    if (lpt.status() == LptStatus::OFFLINE && lpt.selectEverWired()) {
+      display.setPrinterStatus(LptStatus::OFFLINE);
       return;
     }
     if (pwgFailed) {                     // broken raster: drop, keep serving
@@ -398,8 +418,14 @@ void handleIpp(WiFiClient c) {
     uint32_t tWalk = millis();
     while (millis() - tWalk < 10000) {
       int b = -1;
-      // read with timeout helper
-      while ((b = c.available()) == 0) { if (millis() - tWalk > 10000) break; delay(1); }
+      // read with timeout helper; bail early if the peer died mid-request
+      // (connected() is false only with the buffer already drained - no
+      // point spinning to the 10 s cap with the socket gone)
+      while ((b = c.available()) == 0) {
+        if (millis() - tWalk > 10000) break;
+        if (!c.connected()) break;
+        delay(1);
+      }
       if (b <= 0 && !c.available()) break;
       int tag = c.read();
       if (tag == 0x03) break;                       // end of attributes
@@ -546,6 +572,8 @@ void handleIpp(WiFiClient c) {
     }
     ippResp += (char)0x03;                         // end-of-attributes
     bool stored = true;                            // endJob verdict (below)
+    bool truncated = false;                        // transfer ended before all
+                                                   // promised bytes (denied below)
     // stream the document data (after the attr groups) into the spool.
     // Handles both Content-Length and chunked transfer, and knows the doc
     // format (isPwg) - PWG raster files get converted to PCL at print time.
@@ -556,6 +584,7 @@ void handleIpp(WiFiClient c) {
       long remaining = contentLength;   // -1 if chunked
       size_t chunkLeft = 0;
       bool chunkHeaderPending = true;   // need to read a chunk-size line first
+      bool sawTerminal = false;         // chunked: the 0-size terminal chunk arrived
       while (c.connected() && idle < 10000) {
         int av = c.available();
         if (av <= 0) { idle += 10; delay(10); continue; }
@@ -563,9 +592,10 @@ void handleIpp(WiFiClient c) {
         if (chunked) {
           if (chunkHeaderPending) {
             String line = c.readStringUntil('\r'); c.read(); // consume \n
+            if (line.length() == 0) { truncated = true; break; }  // size line never came
             chunkLeft = strtol(line.c_str(), NULL, 16);
             chunkHeaderPending = false;
-            if (chunkLeft == 0) break;             // terminal chunk
+            if (chunkLeft == 0) { sawTerminal = true; break; }    // terminal chunk
             continue;
           }
           int n = c.read(buf, min((size_t)av, min(chunkLeft, sizeof(buf))));
@@ -579,7 +609,7 @@ void handleIpp(WiFiClient c) {
             uint32_t tCrlf = millis();
             while (c.available() < 2 && millis() - tCrlf < 1000) { delay(1); }
             if (c.available() >= 2) { c.read(); c.read(); }
-            else break;
+            else { truncated = true; break; }
             chunkHeaderPending = true;
           }
         } else {
@@ -589,9 +619,14 @@ void handleIpp(WiFiClient c) {
           queue.write(slot, buf, n);
         }
       }
-      // endJob() discards the job when a write did not fit (flash filled
-      // MID-transfer): stored=false tells the client the truth below.
-      stored = queue.endJob(slot, false);
+      // A transfer that died mid-stream (disconnect, stall, missing terminal
+      // chunk, fewer bytes than Content-Length promised) is INCOMPLETE:
+      // finalizing it would print half a page while answering "OK". Cancel
+      // it and deny with client-error-bad-request; the flash-full case
+      // (endJob discarding a failed write) stays server-error-device-error.
+      if (chunked && !sawTerminal) truncated = true;      // no terminal 0-chunk seen
+      if (!chunked && remaining > 0) truncated = true;    // promised bytes missing
+      stored = queue.endJob(slot, truncated);
       rawActive[slot] = false;
       // IDLE only from RECEIVING - see the slot-taking comment above: never
       // clobber PRINTING, or the running job's decoder restarts mid-file.
@@ -601,12 +636,15 @@ void handleIpp(WiFiClient c) {
       }
     }
     if (spooling && (slot < 0 || !stored)) {
-      // refused BEFORE spooling (disk full / too many concurrent jobs) or
-      // the flash filled mid-transfer: tell the client honestly instead of
-      // "OK" + a vanishing job. RFC 8011: 0x0503 = server-error-device-error;
-      // patch the two status bytes written above via substring (String has no
+      // refused BEFORE spooling (disk full / too many concurrent jobs), the
+      // flash filled mid-transfer, or the transfer was truncated: tell the
+      // client honestly instead of "OK" + a vanishing/half job. RFC 8011:
+      // 0x0503 = server-error-device-error (our side is full/broken),
+      // 0x0400 = client-error-bad-request (truncated request body).
+      // Patch the two status bytes written above via substring (String has no
       // writable operator[] in the host test stub, substring works everywhere).
-      ippResp = ippResp.substring(0, statusOff) + (char)0x05 + (char)0x03 +
+      uint16_t deny = truncated ? 0x0400 : 0x0503;
+      ippResp = ippResp.substring(0, statusOff) + (char)(deny >> 8) + (char)(deny & 255) +
                 ippResp.substring(statusOff + 2);
     }
     c.print(ippResp);
@@ -695,6 +733,7 @@ void loop() {
       nc.stop();      // all slots busy or flash full: refuse the connection
     } else {
       rawClients[slot] = nc; rawActive[slot] = true;
+      rawLastByte[slot] = millis();
       // RECEIVING only from IDLE. Overwriting PRINTING here would pause the
       // in-flight job, and the later IDLE->PRINTING transition restarts the
       // PWG decoder on a mid-file reader -> "bad sync" -> job dropped.
@@ -714,6 +753,7 @@ void loop() {
       // returns 0 once the FS is full, endJob() then discards the truncated
       // job instead of finalizing a half page. The accept-time check above
       // covers the "already full" case.
+      rawLastByte[i] = millis();
       uint8_t buf[512];
       int n = rawClients[i].read(buf, min(av, (int)sizeof(buf)));
       for (int k = 0; k < n; k++) queue.writeByte(i, buf[k]);
@@ -723,6 +763,19 @@ void loop() {
       rawActive[i] = false;
       // leave RECEIVING only (never clobber PRINTING - decoder-restart bug,
       // see the accept comment above)
+      if (engState == EngineState::RECEIVING) {
+        engState = EngineState::IDLE;
+        display.setState(uiFor(engState));
+      }
+    } else if (millis() - rawLastByte[i] > RAW_IDLE_TIMEOUT_MS) {
+      // connected() still true but not a byte in RAW_IDLE_TIMEOUT_MS: the
+      // peer is a ghost (crashed mid-send / half-open connection). The
+      // spooled data is incomplete - cancel it (endJob discards), free the
+      // slot. Real print streams never pause this long mid-job.
+      Serial.printf("[raw] slot %d idle %lus - dropping ghost job\n", i, (unsigned long)RAW_IDLE_TIMEOUT_MS / 1000);
+      queue.endJob(i, true);
+      rawClients[i].stop();
+      rawActive[i] = false;
       if (engState == EngineState::RECEIVING) {
         engState = EngineState::IDLE;
         display.setState(uiFor(engState));

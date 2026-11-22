@@ -18,6 +18,10 @@ static const int DATA_PINS[8] = {
 #define W_SELECT  0x08
 #define W_ERROR   0x10
 
+bool ParallelPort::selectEverWired() const {
+  return (wiredMask & W_SELECT) != 0;
+}
+
 const char* lptStatusName(LptStatus s) {
   switch (s) {
     case LptStatus::ONLINE:      return "готов";
@@ -127,9 +131,25 @@ bool ParallelPort::writeByte(uint8_t b, uint32_t timeoutMs) {
   uint32_t start = millis();
 
   // wait for ready (BUSY low, not error/paper-out/offline)
+  // selLow timing: SELECT low for a sustained second means the printer is
+  // deselected (powered off / offline button / nothing wired to the port).
+  // It will not take this byte - waiting the full BUSY timeout (120 s,
+  // meant for page-feed busy) froze the whole box, web UI included, for
+  // two minutes per job. Fail fast instead; the caller drops the job with
+  // an honest "нет ответа LPT". A wired printer that merely blips SELECT
+  // (mode negotiation) never trips a full second.
+  bool selLow = false;
+  uint32_t selLowSince = 0;
   while (!isAccepting()) {
     if (millis() - start > timeoutMs) return false;
     if (digitalRead(PIN_LPT_ERROR) == LOW || digitalRead(PIN_LPT_PE) == HIGH) return false;
+    if (digitalRead(PIN_LPT_SELECT) == HIGH) {
+      selLow = false;
+    } else if (!selLow) {
+      selLow = true; selLowSince = millis();
+    } else if (millis() - selLowSince >= 1000) {
+      return false;                      // deselected: never going to accept
+    }
     delayMicroseconds(20);
   }
 
