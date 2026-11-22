@@ -27,7 +27,10 @@ public:
   void markFormat(int clientId, bool pwgRaster); // remember doc format for this job
   void write(int clientId, const uint8_t* buf, size_t len);  // buffered write
   void writeByte(int clientId, uint8_t b);
-  void endJob(int clientId, bool cancel);    // finalize or discard
+  // Finalize or discard. Returns true only if the job was actually stored:
+  // cancelled, empty, or write-failed (flash filled mid-transfer) jobs are
+  // removed - a truncated file must never print as a half page.
+  bool endJob(int clientId, bool cancel);
   bool canStore();                           // flash space available
   bool hasData();                            // oldest complete job ready to print
   int  readByte();                           // -1 = EOF
@@ -43,6 +46,7 @@ private:
   uint32_t writerIds[MAX_CONCURRENT_JOBS] = {0};
   size_t   writerBytes[MAX_CONCURRENT_JOBS] = {0};
   bool     writerIsPwg[MAX_CONCURRENT_JOBS] = {false};
+  bool     writerFailed[MAX_CONCURRENT_JOBS] = {false}; // a write didn't fit
   File reader;
   uint32_t curId = 0;
   size_t curSize = 0;

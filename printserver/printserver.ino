@@ -121,10 +121,16 @@ PwgToPcl pwg;
 bool pwgActive = false;
 bool pwgFailed = false;
 
-// callback: PCL output byte -> LPT
+// callback: PCL output byte -> LPT. Same recovery as feedByteToLpt(): a hung
+// BUSY gets one INIT pulse + short retry; if that also fails, return false
+// so the decoder aborts (the job is then dropped via the pwgFailed branch).
+// Returning false used to be pointless - the decoder ignored it and kept
+// stalling 120 s PER OUTPUT BYTE on a dead printer.
 bool pwgOut(void*, uint8_t b) {
   printBytes++;
-  return lpt.writeByte(b, LPT_BUSY_TIMEOUT_MS);
+  if (lpt.writeByte(b, LPT_BUSY_TIMEOUT_MS)) return true;
+  lpt.resetPrinter();
+  return lpt.writeByte(b, 2000);
 }
 
 void processQueue() {
@@ -149,10 +155,12 @@ void processQueue() {
       queue.dropCurrent();
       pwgFailed = false; pwgActive = false;
       // say WHY the page died: pwg.lastError() is "bad sync"/"bad header"/
-      // "line too wide"/"unsupported colorspace" - the serial log gets the
-      // exact reason, the OLED gets the short human text.
-      Serial.println(String("[pwg] dropped: ") + pwg.lastError());
-      display.setError("битый файл");
+      // "line too wide"/"unsupported colorspace"/"output stalled" - the serial
+      // log gets the exact reason, the OLED gets the short human text
+      // ("output stalled" = LPT dead, not a broken file).
+      String pwgErr = pwg.lastError();
+      Serial.println(String("[pwg] dropped: ") + pwgErr);
+      display.setError(pwgErr == "output stalled" ? "нет ответа LPT" : "битый файл");
       engState = EngineState::IDLE;
       display.setState(uiFor(engState));
       return;
@@ -336,9 +344,18 @@ void handleIpp(WiFiClient c) {
     // a full flash, endJob would keep a truncated file and the print would
     // come out cut mid-page with a success response to the client.
     for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
-    if (slot >= 0 && !queue.canStore()) slot = -1;   // disk full: refuse below
-    if (slot >= 0) { queue.startJob(slot); rawActive[slot] = true; engState = EngineState::RECEIVING;
-      display.setState(UiState::RECEIVING); }
+    if (slot >= 0 && (!queue.canStore() || !queue.startJob(slot))) slot = -1;   // disk full / open failed
+    if (slot >= 0) {
+      rawActive[slot] = true;
+      // RECEIVING only from IDLE: clobbering PRINTING here would pause the
+      // in-flight job, and its later IDLE->PRINTING restart calls pwg.begin()
+      // on a reader that is mid-file -> "bad sync" -> the job is dropped.
+      // Spool-and-print concurrently instead: the queue is designed for it.
+      if (engState == EngineState::IDLE) {
+        engState = EngineState::RECEIVING;
+        display.setState(UiState::RECEIVING);
+      }
+    }
   }
 
   // ---- walk attribute groups to find end-of-attributes (0x03) ----
@@ -404,6 +421,18 @@ void handleIpp(WiFiClient c) {
       first = false;
     }
   };
+  // integer (0x21) / enum (0x23) values are BINARY 4-byte. The old code sent
+  // queued-job-count / copies-default / printer-up-time as keyword strings
+  // ("0"/"1") - a type mismatch a strict RFC 8011 client rejects the whole
+  // response for - and job-id/printer-state were hand-rolled per-attribute.
+  auto attrInt = [&](uint8_t tag, const char* name, uint32_t v) {
+    uint16_t nl = strlen(name);
+    ippResp += (char)tag; ippResp += (char)(nl >> 8); ippResp += (char)(nl & 255);
+    ippResp += name;
+    ippResp += (char)0; ippResp += (char)4;
+    ippResp += (char)(v >> 24); ippResp += (char)(v >> 16);
+    ippResp += (char)(v >> 8);  ippResp += (char)(v);
+  };
   ippResp += (char)0x01; ippResp += (char)0x01;   // version 1.1
   uint16_t status = 0;
   ippResp += (char)(status >> 8); ippResp += (char)(status & 255);
@@ -437,25 +466,26 @@ void handleIpp(WiFiClient c) {
       attrStrMulti(0x49, "document-format-supported",
                    {"image/pwg-raster", "application/vnd.hp-pcl", "application/octet-stream"});
       attrStrMulti(0x44, "ipp-versions-supported", {"1.1", "2.0"});
-      attrStr(0x44, "printer-state", "idle");
-      attrStr(0x44, "printer-state-reasons", "none");
-      // boolean printer-is-accepting-jobs
+      // printer-state: RFC 8011 enum, emitted ONCE (a keyword "idle" copy
+      // used to precede it - two attributes with the same name and
+      // conflicting types in one group). Live: 5 (processing) while the
+      // engine feeds a job, 3 (idle) otherwise.
+      attrInt(0x23, "printer-state", engState == EngineState::PRINTING ? 5 : 3);
+      // honest reasons: paper-out and LPT error are things the client/user
+      // can actually act on; a dead disk is "other"
+      attrStr(0x44, "printer-state-reasons",
+              lpt.status() == LptStatus::PAPER_OUT ? "media-empty" :
+              lpt.status() == LptStatus::ERROR_STATE ? "other" : "none");
+      // boolean printer-is-accepting-jobs: tied to actual spool capacity
+      // (flash below the free margin = not accepting), not a hard "yes"
       {
         const char* n = "printer-is-accepting-jobs";
         uint16_t nl = strlen(n);
         ippResp += (char)0x22; ippResp += (char)(nl >> 8); ippResp += (char)(nl & 255);
-        ippResp += n; ippResp += (char)0; ippResp += (char)1; ippResp += (char)1;
+        ippResp += n; ippResp += (char)0; ippResp += (char)1;
+        ippResp += (char)(queue.canStore() ? 1 : 0);
       }
-      // enum printer-state (3 = idle)
-      {
-        const char* n = "printer-state";
-        uint16_t nl = strlen(n);
-        ippResp += (char)0x23; ippResp += (char)(nl >> 8); ippResp += (char)(nl & 255);
-        ippResp += n; ippResp += (char)0; ippResp += (char)4;
-        ippResp += (char)0; ippResp += (char)0; ippResp += (char)0; ippResp += (char)3;
-        // (string duplicate above removed in this edit)
-      }
-      attrStr(0x44, "queued-job-count", "0");
+      attrInt(0x21, "queued-job-count", (uint32_t)queue.pendingCount());   // live, not "0"
       attrStrMulti(0x44, "media-supported", {"iso_a4_210x297mm", "na_letter_8.5x11in"});
       attrStr(0x44, "media-default", "iso_a4_210x297mm");
       attrStr(0x44, "print-color-mode-default", "monochrome");
@@ -463,8 +493,8 @@ void handleIpp(WiFiClient c) {
       attrStr(0x44, "pdl-override-supported", "not-attempted");
       attrStrMulti(0x44, "compression-supported", {"none"});
       attrStrMulti(0x44, "sides-supported", {"one-sided"});
-      attrStr(0x44, "copies-default", "1");
-      attrStr(0x44, "printer-up-time", String(millis() / 1000).c_str());
+      attrInt(0x21, "copies-default", 1);
+      attrInt(0x21, "printer-up-time", millis() / 1000);
       // pwg-raster-document-parameters Android looks for. A B&W printserver
       // must advertise BOTH types (Michael Sweet's guidance on the PWG list,
       // https://www.pwg.org/archives/ipp/2014/018345.html): black_1 (1-bit)
@@ -478,31 +508,13 @@ void handleIpp(WiFiClient c) {
       attrStrMulti(0x44, "printer-resolution-supported", {"300dpi"});
     } else if (opId == 0x0002) {
       ippResp += (char)0x02;                       // job attributes tag
-      // job-id integer 1
-      uint16_t nl = strlen("job-id");
-      ippResp += (char)0x21; ippResp += (char)(nl >> 8); ippResp += (char)(nl & 255);
-      ippResp += "job-id";
-      ippResp += (char)0; ippResp += (char)4;
-      ippResp += (char)0; ippResp += (char)0; ippResp += (char)0; ippResp += (char)1;
-      // enum job-state (3 = pending)
-      nl = strlen("job-state");
-      ippResp += (char)0x23; ippResp += (char)(nl >> 8); ippResp += (char)(nl & 255);
-      ippResp += "job-state";
-      ippResp += (char)0; ippResp += (char)4;
-      ippResp += (char)0; ippResp += (char)0; ippResp += (char)0; ippResp += (char)3;
+      attrInt(0x21, "job-id", 1);                  // integer
+      attrInt(0x23, "job-state", 3);               // enum: 3 = pending
       attrStr(0x44, "job-state-reasons", "none");
       attrStr(0x42, "job-uri", ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/1").c_str());
     }
     ippResp += (char)0x03;                         // end-of-attributes
-    if (spooling && slot < 0) {
-      // refused BEFORE spooling (disk full / too many concurrent jobs):
-      // tell the client honestly instead of "OK" + a vanishing job.
-      // RFC 8011: 0x0503 = server-error-device-error; patch the two
-      // status bytes written above via substring (String has no writable
-      // operator[] in the host test stub, substring works everywhere).
-      ippResp = ippResp.substring(0, statusOff) + (char)0x05 + (char)0x03 +
-                ippResp.substring(statusOff + 2);
-    }
+    bool stored = true;                            // endJob verdict (below)
     // stream the document data (after the attr groups) into the spool.
     // Handles both Content-Length and chunked transfer, and knows the doc
     // format (isPwg) - PWG raster files get converted to PCL at print time.
@@ -546,16 +558,36 @@ void handleIpp(WiFiClient c) {
           queue.write(slot, buf, n);
         }
       }
-      queue.endJob(slot, false);
+      // endJob() discards the job when a write did not fit (flash filled
+      // MID-transfer): stored=false tells the client the truth below.
+      stored = queue.endJob(slot, false);
       rawActive[slot] = false;
-      engState = EngineState::IDLE;
-      display.setState(uiFor(engState));
+      // IDLE only from RECEIVING - see the slot-taking comment above: never
+      // clobber PRINTING, or the running job's decoder restarts mid-file.
+      if (engState == EngineState::RECEIVING) {
+        engState = EngineState::IDLE;
+        display.setState(uiFor(engState));
+      }
+    }
+    if (spooling && (slot < 0 || !stored)) {
+      // refused BEFORE spooling (disk full / too many concurrent jobs) or
+      // the flash filled mid-transfer: tell the client honestly instead of
+      // "OK" + a vanishing job. RFC 8011: 0x0503 = server-error-device-error;
+      // patch the two status bytes written above via substring (String has no
+      // writable operator[] in the host test stub, substring works everywhere).
+      ippResp = ippResp.substring(0, statusOff) + (char)0x05 + (char)0x03 +
+                ippResp.substring(statusOff + 2);
     }
     c.print(ippResp);
   } else {
-    // unsupported op
-    ippResp += (char)0x05;   // unsupported
-    ippResp += (char)0x03;
+    // unsupported operation (e.g. CUPS Get-Jobs / Cancel-Job): respond with
+    // client-error-operation-not-supported (0x040C) and a VALID attribute
+    // list. The old code appended two stray bytes where attributes were
+    // expected and left the success status (0x0000) in place - strict
+    // clients failed parsing the whole response.
+    ippResp = ippResp.substring(0, statusOff) + (char)0x04 + (char)0x0C +
+              ippResp.substring(statusOff + 2);
+    ippResp += (char)0x03;                         // end-of-attributes
     c.print(ippResp);
   }
   c.stop();
@@ -626,21 +658,31 @@ void loop() {
   // raw 9100 accept + pump
   WiFiClient nc = rawServer.accept();
   if (nc) {
-    for (int i = 0; i < MAX_RAW_CLIENTS; i++) {
-      if (!rawActive[i]) {
-        rawClients[i] = nc; rawActive[i] = true;
-        queue.startJob(i);
+    int slot = -1;
+    for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
+    if (slot < 0 || !queue.canStore() || !queue.startJob(slot)) {
+      nc.stop();      // all slots busy or flash full: refuse the connection
+    } else {
+      rawClients[slot] = nc; rawActive[slot] = true;
+      // RECEIVING only from IDLE. Overwriting PRINTING here would pause the
+      // in-flight job, and the later IDLE->PRINTING transition restarts the
+      // PWG decoder on a mid-file reader -> "bad sync" -> job dropped.
+      // Receiving while printing is fine: spool and print run in parallel.
+      if (engState == EngineState::IDLE) {
         engState = EngineState::RECEIVING;
         display.setState(UiState::RECEIVING);
-        break;
       }
-      if (i == MAX_RAW_CLIENTS - 1) nc.stop();
     }
   }
   for (int i = 0; i < MAX_RAW_CLIENTS; i++) {
     if (!rawActive[i] || !rawClients[i]) continue;
     int av = rawClients[i].available();
     if (av > 0) {
+      // No canStore() poll here (it walks the FS): a mid-receive fill is
+      // caught exactly by PrintQueue's sticky write-failure flag - writeByte
+      // returns 0 once the FS is full, endJob() then discards the truncated
+      // job instead of finalizing a half page. The accept-time check above
+      // covers the "already full" case.
       uint8_t buf[512];
       int n = rawClients[i].read(buf, min(av, (int)sizeof(buf)));
       for (int k = 0; k < n; k++) queue.writeByte(i, buf[k]);
@@ -648,8 +690,12 @@ void loop() {
       queue.endJob(i, false);
       rawClients[i].stop();
       rawActive[i] = false;
-      engState = EngineState::IDLE;
-      display.setState(uiFor(engState));
+      // leave RECEIVING only (never clobber PRINTING - decoder-restart bug,
+      // see the accept comment above)
+      if (engState == EngineState::RECEIVING) {
+        engState = EngineState::IDLE;
+        display.setState(uiFor(engState));
+      }
     }
   }
 

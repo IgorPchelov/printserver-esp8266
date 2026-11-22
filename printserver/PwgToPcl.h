@@ -52,6 +52,7 @@ public:
     pages = rowsOut = inRow = 0;
     lastErr = nullptr;
     headerDone = false;
+    outFailed = false;
   }
 
   // Feed one input byte. Returns false on unrecoverable error (see lastError).
@@ -60,6 +61,10 @@ public:
   // bytes just like 8-bit rows - the run decoding below is bit-depth agnostic.
   // Only the final unpacking of lineBuf into bits differs per depth.
   bool feed(uint8_t b) {
+    if (outFailed) {                   // the output sink failed earlier (dead
+      if (!lastErr) lastErr = "output stalled";   // LPT): abort instead of
+      return false;                    // hammering it for the rest of the job
+    }
     switch (phase) {
       case Phase::SYNC:
         syncVal = (syncVal << 8) | b;
@@ -151,10 +156,11 @@ private:
   uint32_t rowRepeat = 0, runLeft = 0, runMode = 0, pxIdx = 0;
   uint8_t px[3];
   uint32_t colByte = 0;      // decoded bytes in current line
-  uint32_t inRow = 0;        // source rows consumed for current page
+  uint32_t inRow = 0;        // PAGE rows emitted for current page (incl. repeats)
   uint32_t outRow = 0;       // rows emitted (incl. repeats)
   uint32_t pages = 0, rowsOut = 0;
   const char* lastErr = nullptr;
+  bool outFailed = false;    // the output callback returned false once
   // 1-bit PCL output row: 8 pixels per byte, MSB first.
   // (MAX_RASTER_WIDTH + 7) / 8 = 319 B for 2550 px. The old
   // MAX_RASTER_WIDTH / 8 truncated to 318 B, so the last byte of a
@@ -162,7 +168,16 @@ private:
   // silently corrupting the adjacent lineBuf.
   uint8_t pclRow[(MAX_RASTER_WIDTH + 7) / 8 > 0 ? (MAX_RASTER_WIDTH + 7) / 8 : 1];
 
-  bool put(uint8_t b) { return out ? out(ctx, b) : true; }
+  // OutFn's "return false to abort" contract was never enforced: put()
+  // discarded the result, so a failing sink (dead LPT) was retried for every
+  // remaining byte of the job. Now the first failure latches outFailed and
+  // feed() aborts (lastError "output stalled").
+  bool put(uint8_t b) {
+    if (!out) return true;                   // no sink configured: accept
+    if (outFailed) return false;
+    if (!out(ctx, b)) { outFailed = true; return false; }
+    return true;
+  }
   bool puts(const char* s) { while (*s) if (!put((uint8_t)*s++)) return false; return true; }
 
   bool parseHeader() {
@@ -204,6 +219,13 @@ private:
       lastErr = "unsupported colorspace";
       return false;
     }
+    // Bit-depth guard: finishLine() implements 1/8/24 bpp only. 16-bit gray
+    // (bpc=16 -> 2 B/px) used to fall through to the "3 bytes/pixel" branch
+    // and print garbage rows; anything else is refused honestly.
+    if (hdrBpc != 1 && hdrBpc != 8 && hdrBpc != 24) {
+      lastErr = "unsupported bit depth";
+      return false;
+    }
     if (hdrResX == 0 || hdrResY == 0) { hdrResX = hdrResY = 300; }
     return true;
   }
@@ -214,9 +236,14 @@ private:
     char t[48];
     snprintf(t, sizeof(t), "\x1b&u%uD\x1b*t%uR", (unsigned)hdrResX, (unsigned)hdrResX);
     puts(t);                                        // units + raster resolution
-    // A4 (210x297mm) default; keep page size to the header's points
-    uint32_t pw = be32hdr(PWG_OFF_PAGESIZE), ph = be32hdr(PWG_OFF_PAGESIZE + 4);
-    snprintf(t, sizeof(t), "\x1b&l26A");            // A4; fine for LJ-class
+    // PCL page size from the header's PageSize (points). The old code always
+    // sent 26A (A4): a Letter-width raster (612x792 pt - one of the two media
+    // we advertise in IPP) landed on a narrower declared page and was clipped
+    // by the printer. 612 pt -> Letter (2A), 595 pt -> A4 (26A), else A4.
+    uint32_t pw = be32hdr(PWG_OFF_PAGESIZE);
+    const char* pageCode = "26";                    // A4
+    if (pw >= 600 && pw <= 625) pageCode = "2";     // US Letter 612 pt
+    snprintf(t, sizeof(t), "\x1b&l%sA", pageCode);
     puts(t);
     snprintf(t, sizeof(t), "\x1b*r%uS\x1b*r%uT", (unsigned)hdrW, (unsigned)hdrH);
     puts(t);                                        // raster width/height
@@ -272,7 +299,13 @@ private:
     for (uint32_t i = 0; i < outBytes; i++) put(pclRow[i]);
     rowsOut++;
     outRow++;
-    inRow++;
+    // A repeat-coded row stands for rowRepeat PAGE rows (the repeats below
+    // each emit the same transfer again). Counting coding units here (the
+    // old inRow++) left inRow below cupsHeight on pages with repeat-coded
+    // rows, so the page never completed and the NEXT page's header was
+    // decoded as garbage rows of this page (multi-page prints died with
+    // "bad header").
+    inRow += rowRepeat;
     // repeats of this row
     for (uint32_t r = 1; r < rowRepeat; r++) {
       puts(t);

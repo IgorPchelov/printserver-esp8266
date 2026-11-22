@@ -446,6 +446,141 @@ int main() {
     }
   }
 
+  // ---------- regression: multi-page stream (inRow must count repeats) -------
+  // A repeat-coded row represents rowRepeat PAGE rows, but inRow was bumped
+  // once per CODING unit: after a page whose rows are repeat-coded (Android
+  // does this for every blank band) inRow stayed below cupsHeight, the page
+  // never "completed", and the NEXT page's 1796-byte header was decoded as
+  // garbage rows of the current page -> "bad header" / lost pages. A 2-page
+  // document must emit exactly 2 form feeds and 2 pages.
+  {
+    outBytes.clear();
+    const uint32_t W = 8, H = 2;
+    auto buildPage = [&](std::vector<uint8_t>& d) {
+      std::vector<uint8_t> h(PWG_HDR_SIZE, 0);
+      auto p = [&](uint16_t off, uint32_t val) {
+        h[off] = val >> 24; h[off+1] = val >> 16; h[off+2] = val >> 8; h[off+3] = val;
+      };
+      p(PWG_OFF_HWRES_X, 300); p(PWG_OFF_HWRES_Y, 300);
+      p(PWG_OFF_WIDTH, W); p(PWG_OFF_HEIGHT, H);
+      p(PWG_OFF_BPP, 1); p(PWG_OFF_BYTESLINE, 1);
+      p(PWG_OFF_COLORSPACE, 3);                 // K
+      memcpy(&h[0], "PwgRaster", 9);
+      d.insert(d.end(), h.begin(), h.end());
+      // ONE coding unit: repeat count 1 (row appears 2x = the whole page),
+      // then ctl=0 (repeat 1 "pixel" = 1 packed byte) of 0x00 (black)
+      d.push_back(1);
+      d.push_back(0); d.push_back(0x00);
+    };
+    std::vector<uint8_t> d10;
+    d10.push_back('R'); d10.push_back('a'); d10.push_back('S'); d10.push_back('2');
+    buildPage(d10);                            // page 1
+    buildPage(d10);                            // page 2 (header right after rows)
+    PwgToPcl c10;
+    c10.begin(fakeLpt, nullptr);
+    bool ok10 = true;
+    for (uint8_t b : d10) if (!c10.feed(b)) { ok10 = false; break; }
+    CHECK(ok10, "multi-page: stream consumed without error");
+    c10.end();
+    CHECK(c10.pagesPrinted() == 2, "multi-page: exactly 2 pages emitted");
+    CHECK(!strcmp(c10.lastError(), ""), "multi-page: no error");
+    std::string s10(outBytes.begin(), outBytes.end());
+    int ff = 0;
+    for (size_t i = 0; i < s10.size(); i++) if (s10[i] == '\x0c') ff++;
+    CHECK(ff == 2, "multi-page: one form feed per page");
+    int rasterStarts = 0;
+    for (size_t p10 = 0; (p10 = s10.find("\x1b*r1A", p10)) != std::string::npos; rasterStarts++, p10++);
+    CHECK(rasterStarts == 2, "multi-page: raster started once per page");
+  }
+
+  // ---------- regression: output abort propagates (dead printer) -------------
+  // pwgOut() used to ignore writeByte() failures, so a dead/stalled LPT made
+  // every output byte wait the full 120 s timeout and the job never finished
+  // or dropped. The decoder must abort on the first failed output byte.
+  {
+    outBytes.clear();
+    lptTimeouts = 1;                           // fakeLpt now fails every byte
+    const uint32_t W = 8, H = 1;
+    std::vector<uint8_t> d11;
+    d11.push_back('R'); d11.push_back('a'); d11.push_back('S'); d11.push_back('2');
+    std::vector<uint8_t> h(PWG_HDR_SIZE, 0);
+    auto p11 = [&](uint16_t off, uint32_t val) {
+      h[off] = val >> 24; h[off+1] = val >> 16; h[off+2] = val >> 8; h[off+3] = val;
+    };
+    p11(PWG_OFF_HWRES_X, 300); p11(PWG_OFF_HWRES_Y, 300);
+    p11(PWG_OFF_WIDTH, W); p11(PWG_OFF_HEIGHT, H);
+    p11(PWG_OFF_BPP, 1); p11(PWG_OFF_BYTESLINE, 1);
+    p11(PWG_OFF_COLORSPACE, 3);
+    memcpy(&h[0], "PwgRaster", 9);
+    d11.insert(d11.end(), h.begin(), h.end());
+    d11.push_back(0); d11.push_back(0); d11.push_back(0x00);
+    PwgToPcl c11;
+    c11.begin(fakeLpt, nullptr);
+    bool ok11 = true;
+    for (uint8_t b : d11) if (!c11.feed(b)) { ok11 = false; break; }
+    CHECK(!ok11, "output failure aborts the conversion");
+    CHECK(!strcmp(c11.lastError(), "output stalled"), "abort reason is 'output stalled'");
+    lptTimeouts = 0;                           // restore for later tests
+  }
+
+  // ---------- regression: unsupported bit depth refused honestly -------------
+  // 16-bit gray (bpc=16, bpp=2) used to slip through the colorspace check and
+  // land in the "3 bytes/pixel" branch of finishLine() - i.e. garbage rows.
+  {
+    outBytes.clear();
+    PwgToPcl c12;
+    c12.begin(fakeLpt, nullptr);
+    std::vector<uint8_t> d12;
+    d12.push_back('R'); d12.push_back('a'); d12.push_back('S'); d12.push_back('2');
+    std::vector<uint8_t> h(PWG_HDR_SIZE, 0);
+    auto p12 = [&](uint16_t off, uint32_t val) {
+      h[off] = val >> 24; h[off+1] = val >> 16; h[off+2] = val >> 8; h[off+3] = val;
+    };
+    p12(PWG_OFF_HWRES_X, 300); p12(PWG_OFF_HWRES_Y, 300);
+    p12(PWG_OFF_WIDTH, 64); p12(PWG_OFF_HEIGHT, 2);
+    p12(PWG_OFF_BPP, 16); p12(PWG_OFF_BYTESLINE, 128);
+    p12(PWG_OFF_COLORSPACE, 18);               // SW gray, but 16-bit
+    memcpy(&h[0], "PwgRaster", 9);
+    d12.insert(d12.end(), h.begin(), h.end());
+    bool ok12 = true;
+    for (uint8_t b : d12) if (!c12.feed(b)) { ok12 = false; break; }
+    CHECK(!ok12 && !strcmp(c12.lastError(), "unsupported bit depth"),
+          "16-bit gray refused with a clear reason, not garbage rows");
+  }
+
+  // ---------- regression: PCL page size follows the header PageSize ----------
+  // The prologue always sent ESC&l26A (A4). Letter-width rasters (we advertise
+  // na_letter!) landed on a narrower declared page and were clipped. Now the
+  // PageSize points select the PCL code: 612 pt -> Letter (2A), 595 -> A4 (26A),
+  // anything else falls back to A4.
+  {
+    auto pageSizeTest = [&](uint32_t pw, const char* expect, const char* absent, const char* msg) {
+      outBytes.clear();
+      std::vector<uint8_t> d;
+      d.push_back('R'); d.push_back('a'); d.push_back('S'); d.push_back('2');
+      std::vector<uint8_t> h(PWG_HDR_SIZE, 0);
+      auto p = [&](uint16_t off, uint32_t val) {
+        h[off] = val >> 24; h[off+1] = val >> 16; h[off+2] = val >> 8; h[off+3] = val;
+      };
+      p(PWG_OFF_HWRES_X, 300); p(PWG_OFF_HWRES_Y, 300);
+      p(PWG_OFF_WIDTH, 8); p(PWG_OFF_HEIGHT, 1);
+      p(PWG_OFF_BPP, 1); p(PWG_OFF_BYTESLINE, 1);
+      p(PWG_OFF_COLORSPACE, 3);
+      p(PWG_OFF_PAGESIZE, pw); p(PWG_OFF_PAGESIZE + 4, 792);
+      memcpy(&h[0], "PwgRaster", 9);
+      d.insert(d.end(), h.begin(), h.end());
+      d.push_back(0); d.push_back(0); d.push_back(0x00);
+      PwgToPcl c;
+      c.begin(fakeLpt, nullptr);
+      for (uint8_t b : d) c.feed(b);
+      c.end();
+      std::string s(outBytes.begin(), outBytes.end());
+      CHECK(s.find(expect) != std::string::npos && s.find(absent) == std::string::npos, msg);
+    };
+    pageSizeTest(612, "\x1b&l2A", "\x1b&l26A", "Letter (612 pt) -> PCL code 2A, not 26A");
+    pageSizeTest(595, "\x1b&l26A", "\x1b&l2A;", "A4 (595 pt) -> PCL code 26A");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }

@@ -26,9 +26,16 @@ void PrintQueue::cleanupStale() {
     if (!n.startsWith("/") ) n = String(QUEUE_FILES_PREFIX) + n;
     if (n.endsWith(".tmp")) {
       LittleFS.remove(n);   // job never finalized: power loss mid-transfer
-    } else if (n.endsWith(".ok")) {
-      uint32_t id = (uint32_t) n.substring(n.lastIndexOf('/') + 1, n.length() - 3).toInt();
-      if (id >= nextId) nextId = id + 1;
+    } else {
+      // Track ids of BOTH finalized flavours (.ok raw, .okw PWG). The old
+      // code parsed only ".ok": a queue holding only Android PWG jobs reset
+      // nextId to 1 on every reboot, and the next spooled job silently
+      // OVERWROTE the oldest queued .okw file (job loss after each reboot).
+      bool pwg = n.endsWith(".okw");
+      if (pwg || n.endsWith(".ok")) {
+        uint32_t id = (uint32_t) n.substring(n.lastIndexOf('/') + 1, n.length() - (pwg ? 4 : 3)).toInt();
+        if (id >= nextId) nextId = id + 1;
+      }
     }
   }
   dir.close();
@@ -43,7 +50,7 @@ void PrintQueue::rescan() {
     String n = f.name();
     f.close();
     if (!n.startsWith("/")) n = String(QUEUE_FILES_PREFIX) + n;
-    if (n.endsWith(".ok")) pending++;
+    if (n.endsWith(".ok") || n.endsWith(".okw")) pending++;   // both flavours
   }
   dir.close();
 }
@@ -71,33 +78,44 @@ void PrintQueue::markFormat(int clientId, bool pwgRaster) {
 
 void PrintQueue::writeByte(int clientId, uint8_t b) {
   if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId]) return;
-  writers[clientId].write(b);
+  if (writers[clientId].write(b) != 1) writerFailed[clientId] = true;  // flash full mid-job
   if (++writerBytes[clientId] % 4096 == 0) writers[clientId].flush();
 }
 
 void PrintQueue::write(int clientId, const uint8_t* buf, size_t len) {
   if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId] || !buf || !len) return;
-  writers[clientId].write(buf, len);
+  size_t w = writers[clientId].write(buf, len);
+  if (w < len) writerFailed[clientId] = true;   // truncated write: flash full
   writerBytes[clientId] += len;
   if (writerBytes[clientId] % 4096 < len) writers[clientId].flush();  // ~every 4 KB
 }
 
-void PrintQueue::endJob(int clientId, bool cancel) {
-  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId]) return;
+// Returns true only if the job was finalized into the queue (renamed to
+// .ok/.okw and counted in pending()). A job whose writes failed anywhere
+// (flash filled mid-transfer) is DISCARDED: finalizing it would print half
+// a page while telling the client "OK" (IPP handlers use the return value
+// to answer honestly with 0x0503 instead).
+bool PrintQueue::endJob(int clientId, bool cancel) {
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId]) return false;
   uint32_t id = writerIds[clientId];
   bool empty = writerBytes[clientId] == 0;
+  bool failed = writerFailed[clientId];
   String tmp = jobPath(id, false);
   writers[clientId].close();
   writers[clientId] = File();
-  if (cancel || empty) {
+  bool finalized = false;
+  if (cancel || empty || failed) {
     LittleFS.remove(tmp);
   } else {
     // ".ok" = raw passthrough bytes; ".okw" = PWG raster (needs conversion)
     LittleFS.rename(tmp, jobPath(id, true) + (writerIsPwg[clientId] ? "w" : ""));
     pending++;
     doneCount++;
-    writerIsPwg[clientId] = false;
+    finalized = true;
   }
+  writerIsPwg[clientId] = false;
+  writerFailed[clientId] = false;
+  return finalized;
 }
 
 bool PrintQueue::hasData() {
