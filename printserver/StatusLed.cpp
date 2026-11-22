@@ -64,7 +64,8 @@ void StatusLed::tick() {
       break;
   }
 
-  // steady colour: write once when it changes (raw() no-ops on same colour)
+  // steady colour: rewritten on every tick - cheap (a no-change neopixelWrite
+  // re-sends the same colour) and immune to a missed state-change edge
   if (period == 0) { raw(r, g, b); return; }
 
   // blinking: toggle on half-period boundaries

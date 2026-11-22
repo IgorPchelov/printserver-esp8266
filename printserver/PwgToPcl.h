@@ -55,6 +55,10 @@ public:
   }
 
   // Feed one input byte. Returns false on unrecoverable error (see lastError).
+  // Row-unit note (verified against CUPS cups/raster-stream.c): the PackBits
+  // "pixel" unit is (cupsBitsPerPixel+7)/8 BYTES, so 1-bit rows repeat single
+  // bytes just like 8-bit rows - the run decoding below is bit-depth agnostic.
+  // Only the final unpacking of lineBuf into bits differs per depth.
   bool feed(uint8_t b) {
     switch (phase) {
       case Phase::SYNC:
@@ -67,7 +71,7 @@ public:
       case Phase::HDR:
         hdr[fill++] = b;
         if (fill == PWG_HDR_SIZE) {
-          if (!parseHeader()) { lastErr = "bad header"; return false; }
+          if (!parseHeader()) { lastErr = lastErr ? lastErr : "bad header"; return false; }
           emitPagePrologue();
           phase = Phase::ROWCTL; fill = 0;
         }
@@ -79,8 +83,9 @@ public:
         break;
       case Phase::LINE: {
         // decode one compressed line into lineBuf
-        if (b == 128) {                    // fill rest with white
-          while (colByte < hdrBytesLine) lineBuf[colByte++] = 0xFF;
+        if (b == 128) {                    // fill rest of line to the space's
+          uint8_t fillByte = fillByteForSpace();  // "no ink" level (see fn)
+          while (colByte < hdrBytesLine) lineBuf[colByte++] = fillByte;
           finishLine();
         } else if (b & 0x80) {             // literal run: (257-b)*bpp bytes
           runMode = 1; runLeft = (uint32_t)(257 - b) * hdrBpp;
@@ -104,10 +109,18 @@ public:
         if (pxIdx == hdrBpp) {             // got the pixel to repeat
           pxIdx = 0;
           while (runLeft-- > 0 && colByte < hdrBytesLine) {
-            // gray: use the (single) byte; rgb: average -> luma
-            uint8_t g = (hdrBpp == 1) ? px[0]
-                       : (uint8_t)((px[0] * 30 + px[1] * 59 + px[2] * 11) / 100);
-            lineBuf[colByte++] = g;
+            if (hdrBpc == 1) {
+              // black_1: the "pixel" is a packed byte of 8 pixels
+              // (1=white, MSB first) - copy it verbatim, finishLine()
+              // handles the bit unpacking. Thresholding it as a gray
+              // value would turn 0xAA (stripes) into plain white.
+              lineBuf[colByte++] = px[0];
+            } else {
+              // gray: use the (single) byte; rgb: average -> luma
+              uint8_t g = (hdrBpp == 1) ? px[0]
+                         : (uint8_t)((px[0] * 30 + px[1] * 59 + px[2] * 11) / 100);
+              lineBuf[colByte++] = g;
+            }
           }
           if (colByte >= hdrBytesLine) finishLine();
           else phase = Phase::LINE;
@@ -137,7 +150,7 @@ private:
   uint8_t hdr[PWG_HDR_SIZE];
   bool headerDone = false;
   // parsed header
-  uint32_t hdrW = 0, hdrH = 0, hdrBpp = 1, hdrBytesLine = 0, hdrCs = 0;
+  uint32_t hdrW = 0, hdrH = 0, hdrBpp = 1, hdrBpc = 8, hdrBytesLine = 0, hdrCs = 0;
   uint32_t hdrResX = 300, hdrResY = 300;
   uint32_t rowRepeat = 0, runLeft = 0, runMode = 0, pxIdx = 0;
   uint8_t px[3];
@@ -159,12 +172,27 @@ private:
     };
     hdrW = be32(PWG_OFF_WIDTH); hdrH = be32(PWG_OFF_HEIGHT);
     hdrBpp = (be32(PWG_OFF_BPP) + 7) / 8;          // bytes per pixel
+    hdrBpc = be32(PWG_OFF_BPP);                    // raw bits per pixel
     hdrBytesLine = be32(PWG_OFF_BYTESLINE);
     hdrCs = be32(PWG_OFF_COLORSPACE);
     hdrResX = be32(PWG_OFF_HWRES_X); hdrResY = be32(PWG_OFF_HWRES_Y);
     if (!hdrW || !hdrH || !hdrBytesLine || !hdrBpp) return false;
-    if (hdrBytesLine > sizeof(pclRow) * hdrBpp) {  // line too wide for buffer
+    // The INPUT line buffer is the size that matters here (it was wrongly
+    // checked against pclRow, the 1-bit OUTPUT row, so any page wider than
+    // ~300 px was rejected - a full A4 300dpi page never stood a chance).
+    if (hdrBytesLine > sizeof(lineBuf)) {          // input line too wide
       // we threshold at 2400 px (300dpi x 8in); wider images get rejected
+      lastErr = "line too wide";
+      return false;
+    }
+    // Accept the color spaces Android/CUPS actually send a mono printserver:
+    //   3  (K)   black, cupsBitsPerPixel=1 (black_1) or 8 (black_8)
+    //   0  (W), 18 (SW)  gray / sGray, 8 bpp (sgray_8)
+    //   1 (RGB), 19 (SRGB) 8bpc color (srgb_8) - converted to luma below
+    // Anything else (CMYK etc.) cannot be honestly printed: reject instead
+    // of emitting garbage.
+    if (hdrCs != 0 && hdrCs != 1 && hdrCs != 3 && hdrCs != 18 && hdrCs != 19) {
+      lastErr = "unsupported colorspace";
       return false;
     }
     if (hdrResX == 0 || hdrResY == 0) { hdrResX = hdrResY = 300; }
@@ -200,13 +228,34 @@ private:
   }
 
   void finishLine() {
-    // convert the decoded gray line (hdrBytesLine bytes of 8-bit gray) into a
-    // 1-bit PCL row and emit it rowRepeat times
+    // convert the decoded line into a 1-bit PCL row and emit it rowRepeat times.
+    // Input depth handling (verified against CUPS raster semantics):
+    //  - hdrBpc == 1 (black_1): packed bits, MSB first, 1 = white, 0 = black.
+    //    This matches the PDF embedding OpenPrinting's pwgtopdf uses for
+    //    CUPS_CSPACE_K (DeviceGray, no /Decode array -> 0=black, 1=white).
+    //  - hdrBpc == 8 (sgray_8): one gray byte per pixel, threshold at 128.
+    //  - hdrBpc == 24 (srgb_8): 3 bytes/pixel, luma (BT.601), threshold 128.
     uint32_t outBytes = (hdrW + 7) / 8;
     for (uint32_t i = 0; i < outBytes; i++) pclRow[i] = 0xFF;   // white default
-    for (uint32_t x = 0; x < hdrW; x++) {
-      uint8_t g = (x < hdrBytesLine) ? lineBuf[x] : 0xFF;
-      if (g < 128) pclRow[x >> 3] &= ~(0x80 >> (x & 7));        // dark -> bit
+    if (hdrBpc == 1) {
+      // input line is already the packed 1-bit row: (hdrW+7)/8 bytes in
+      // lineBuf, same MSB-first bit order PCL wants - but with 1=white
+      // polarity, and PCL raster rows also use 1=white, so a direct copy
+      // works. Only the length may differ (trailing pad bits).
+      uint32_t inBytes = hdrBytesLine < outBytes ? hdrBytesLine : outBytes;
+      for (uint32_t i = 0; i < inBytes; i++) pclRow[i] = lineBuf[i];
+    } else {
+      for (uint32_t x = 0; x < hdrW; x++) {
+        uint8_t g;
+        if (hdrBpp == 1) g = (x < hdrBytesLine) ? lineBuf[x] : 0xFF;
+        else {                                   // 3 bytes/pixel srgb_8
+          uint32_t o = x * 3;
+          g = (o + 2 < hdrBytesLine)
+                ? (uint8_t)((lineBuf[o] * 30 + lineBuf[o+1] * 59 + lineBuf[o+2] * 11) / 100)
+                : 0xFF;
+        }
+        if (g < 128) pclRow[x >> 3] &= ~(0x80 >> (x & 7));      // dark -> bit
+      }
     }
     char t[24];
     snprintf(t, sizeof(t), "\x1b*b%uW", (unsigned)outBytes);
@@ -227,6 +276,18 @@ private:
       headerDone = false;
     } else {
       phase = Phase::ROWCTL;
+    }
+  }
+
+  // Byte the ctl=128 "fill rest of line" code expands to. CUPS
+  // (cups/raster-stream.c, reader switch on cupsColorSpace) fills W/RGB/SW/
+  // SRGB/RGBW/AdobeRGB with 0xFF (white) and EVERYTHING ELSE - including
+  // K/black, i.e. black_1 jobs - with 0x00. Filling K with white here would
+  // print solid black pages whenever Android ends a short line with 128.
+  uint8_t fillByteForSpace() const {
+    switch (hdrCs) {
+      case 0: case 1: case 18: case 19: return 0xFF;   // W RGB SW SRGB
+      default: return 0x00;                            // K(3) and everything else
     }
   }
 

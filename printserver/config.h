@@ -108,7 +108,11 @@
 
 // ---------------------------------------------------------------- Raster pipeline
 #define DEFAULT_DPI        300
-#define MAX_RASTER_WIDTH   (DEFAULT_DPI * 8 / 1)   // 8.0in printable width at 300dpi = 2400
+// 8.5in (US Letter, the widest common paper - WIDER than A4's 8.27in):
+// buffers sized to 2400 used to reject a full-width A4 page (2480 px @300dpi)
+// and would have cut a Letter page to 8.0in. lineBuf/pclRow live in PSRAM-class
+// statics: 8.5in needs 2550 px = 2550 B input + 320 B output, still tiny.
+#define MAX_RASTER_WIDTH   (DEFAULT_DPI * 17 / 2)   // 8.5in at 300dpi = 2550
 #define PSRAM_CHUNK        (1024 * 1024)
 
 // ---------------------------------------------------------------- Misc

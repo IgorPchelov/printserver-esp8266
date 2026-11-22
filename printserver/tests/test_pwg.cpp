@@ -128,6 +128,159 @@ int main() {
   for (char ch : std::string("RaS3")) if (!bad2.feed((uint8_t)ch)) ok2 = false;
   CHECK(!ok2 && !strcmp(bad2.lastError(), "bad sync"), "bad sync detected");
 
+  // ---------- wide line: full A4 width 300dpi (regression) ----------
+
+  // The old code checked hdrBytesLine (the INPUT line, 310 bytes for a
+  // 2480-px page) against pclRow (the 310-byte... no, 2480/8=310-byte OUTPUT
+  // row is FINE for 1bpp, but for 8bpp gray the input line is 2480 bytes and
+  // was compared against the 310-byte output buffer -> any real Android
+  // page wider than ~300 px was rejected with "bad header". This test
+  // builds exactly such a page and expects it to print.
+  {
+    outBytes.clear();
+    const uint32_t W = 2480, H = 4;            // A4 width at 300 dpi, tiny height
+    std::vector<uint8_t> d2;
+    d2.push_back('R'); d2.push_back('a'); d2.push_back('S'); d2.push_back('2');
+    std::vector<uint8_t> h2(PWG_HDR_SIZE, 0);
+    auto pb = [&](uint16_t off, uint32_t val) {
+      h2[off] = val >> 24; h2[off+1] = val >> 16; h2[off+2] = val >> 8; h2[off+3] = val;
+    };
+    pb(PWG_OFF_HWRES_X, 300); pb(PWG_OFF_HWRES_Y, 300);
+    pb(PWG_OFF_WIDTH, W); pb(PWG_OFF_HEIGHT, H);
+    pb(PWG_OFF_BPP, 8); pb(PWG_OFF_BYTESLINE, W);
+    pb(PWG_OFF_COLORSPACE, 18);                // sgray_8
+    memcpy(&h2[0], "PwgRaster", 9);
+    d2.insert(d2.end(), h2.begin(), h2.end());
+    for (uint32_t r = 0; r < H; r++) {
+      d2.push_back(0);                         // this row once
+      d2.push_back(127);                       // ctl 0..127 = REPEAT run: 128 px
+      d2.push_back(0x00);                      // ...of black 0x00
+      d2.push_back(128);                       // fill rest of line (white for SW)
+    }
+    PwgToPcl c2;
+    c2.begin(fakeLpt, nullptr);
+    bool okw = true;
+    for (uint8_t b : d2) if (!c2.feed(b)) { okw = false; break; }
+    CHECK(okw, "wide 2480-px 8-bpp page accepted (old code rejected >300 px)");
+    c2.end();
+    CHECK(c2.rowsPrinted() == H, "wide page: all rows emitted");
+    CHECK(!strcmp(c2.lastError(), ""), "wide page: no error");
+  }
+
+  // ---------- black_1: 1-bit page (Android's other raster type) ----------
+  {
+    outBytes.clear();
+    const uint32_t W = 64, H = 2;              // 64 px -> 8 packed bytes/row
+    std::vector<uint8_t> d3;
+    d3.push_back('R'); d3.push_back('a'); d3.push_back('S'); d3.push_back('2');
+    std::vector<uint8_t> h3(PWG_HDR_SIZE, 0);
+    auto pb3 = [&](uint16_t off, uint32_t val) {
+      h3[off] = val >> 24; h3[off+1] = val >> 16; h3[off+2] = val >> 8; h3[off+3] = val;
+    };
+    pb3(PWG_OFF_HWRES_X, 300); pb3(PWG_OFF_HWRES_Y, 300);
+    pb3(PWG_OFF_WIDTH, W); pb3(PWG_OFF_HEIGHT, H);
+    pb3(PWG_OFF_BPP, 1);                       // black_1!
+    pb3(PWG_OFF_BYTESLINE, 8);                 // 64 bits = 8 bytes
+    pb3(PWG_OFF_COLORSPACE, 3);                // CUPS_CSPACE_K
+    memcpy(&h3[0], "PwgRaster", 9);
+    d3.insert(d3.end(), h3.begin(), h3.end());
+
+    // Row 1: stripes 0xAA (10101010) - 1=white, 0=black, MSB first
+    d3.push_back(0);                           // appears once
+    d3.push_back(0); d3.push_back(0xAA);       // ctl=0: repeat 1 "pixel" (=byte here), byte 0xAA
+    d3.push_back(128);                         // fill REST OF LINE... in K space
+    // the fill must NOT be needed (8 bytes already done? no: ctl=0 repeated
+    // ONE byte), so the 128-fill covers bytes 1..7 of the packed row and -
+    // per CUPS raster-stream.c - must expand to 0x00 (BLACK) in K space.
+
+    PwgToPcl c3;
+    c3.begin(fakeLpt, nullptr);
+    bool ok3 = true;
+    for (uint8_t b : d3) if (!c3.feed(b)) { ok3 = false; break; }
+    CHECK(ok3, "black_1 page accepted");
+    c3.end();
+    CHECK(c3.rowsPrinted() == 1, "black_1: one row emitted");
+    std::string s3(outBytes.begin(), outBytes.end());
+    size_t p3 = s3.find("\x1b*b8W");
+    CHECK(p3 != std::string::npos, "black_1: 8-byte transfer row present");
+    if (p3 != std::string::npos) {
+      p3 += 5;
+      // first packed byte must be 0xAA verbatim (bit=1 is white in BOTH the
+      // PWG source and the PCL output - no inversion, verified against
+      // OpenPrinting rastertohp.c which fwrites CUPS rows unmodified)
+      CHECK(outBytes[p3] == 0xAA, "black_1: packed byte passed through verbatim");
+      // bytes 1..7 come from the ctl=128 fill: BLACK (0x00) in K space -
+      // the old code filled white and would print near-blank pages
+      bool fillBlack = true;
+      for (int i = 1; i < 8; i++) if (outBytes[p3 + i] != 0x00) fillBlack = false;
+      CHECK(fillBlack, "black_1: ctl=128 fill is BLACK in K space (CUPS semantics)");
+    }
+  }
+
+  // ---------- srgb_8: 24-bit color page -> luma ----------
+  {
+    outBytes.clear();
+    const uint32_t W = 16, H = 1;
+    std::vector<uint8_t> d4;
+    d4.push_back('R'); d4.push_back('a'); d4.push_back('S'); d4.push_back('2');
+    std::vector<uint8_t> h4(PWG_HDR_SIZE, 0);
+    auto pb4 = [&](uint16_t off, uint32_t val) {
+      h4[off] = val >> 24; h4[off+1] = val >> 16; h4[off+2] = val >> 8; h4[off+3] = val;
+    };
+    pb4(PWG_OFF_HWRES_X, 300); pb4(PWG_OFF_HWRES_Y, 300);
+    pb4(PWG_OFF_WIDTH, W); pb4(PWG_OFF_HEIGHT, H);
+    pb4(PWG_OFF_BPP, 24);                      // srgb_8
+    pb4(PWG_OFF_BYTESLINE, W * 3);
+    pb4(PWG_OFF_COLORSPACE, 19);               // CUPS_CSPACE_SRGB
+    memcpy(&h4[0], "PwgRaster", 9);
+    d4.insert(d4.end(), h4.begin(), h4.end());
+
+    d4.push_back(0);                           // row appears once
+    // 16 pixels as literal run: ctl = 257-16 = 241, then 16*3 bytes
+    d4.push_back(241);
+    // 8 black pixels (0,0,0), 8 white pixels (255,255,255)
+    for (int i = 0; i < 8; i++) { d4.push_back(0); d4.push_back(0); d4.push_back(0); }
+    for (int i = 0; i < 8; i++) { d4.push_back(255); d4.push_back(255); d4.push_back(255); }
+
+    PwgToPcl c4;
+    c4.begin(fakeLpt, nullptr);
+    bool ok4 = true;
+    for (uint8_t b : d4) if (!c4.feed(b)) { ok4 = false; break; }
+    CHECK(ok4, "srgb_8 page accepted");
+    c4.end();
+    CHECK(c4.rowsPrinted() == 1, "srgb_8: one row emitted");
+    std::string s4(outBytes.begin(), outBytes.end());
+    size_t p4 = s4.find("\x1b*b2W");           // 16 px -> 2 bytes/row
+    CHECK(p4 != std::string::npos, "srgb_8: 2-byte transfer row present");
+    if (p4 != std::string::npos) {
+      p4 += 5;
+      CHECK(outBytes[p4] == 0x00, "srgb_8: black pixels -> black bits");
+      CHECK(outBytes[p4 + 1] == 0xFF, "srgb_8: white pixels -> white bits");
+    }
+  }
+
+  // ---------- unsupported color space rejected honestly ----------
+  {
+    outBytes.clear();
+    PwgToPcl c5;
+    c5.begin(fakeLpt, nullptr);
+    std::vector<uint8_t> d5;
+    d5.push_back('R'); d5.push_back('a'); d5.push_back('S'); d5.push_back('2');
+    std::vector<uint8_t> h5(PWG_HDR_SIZE, 0);
+    auto pb5 = [&](uint16_t off, uint32_t val) {
+      h5[off] = val >> 24; h5[off+1] = val >> 16; h5[off+2] = val >> 8; h5[off+3] = val;
+    };
+    pb5(PWG_OFF_WIDTH, 32); pb5(PWG_OFF_HEIGHT, 2);
+    pb5(PWG_OFF_BPP, 32); pb5(PWG_OFF_BYTESLINE, 128);
+    pb5(PWG_OFF_COLORSPACE, 6);                // CMYK - not printable on LPT mono
+    memcpy(&h5[0], "PwgRaster", 9);
+    d5.insert(d5.end(), h5.begin(), h5.end());
+    bool ok5 = true;
+    for (uint8_t b : d5) if (!c5.feed(b)) { ok5 = false; break; }
+    CHECK(!ok5 && !strcmp(c5.lastError(), "unsupported colorspace"),
+          "CMYK raster rejected with a clear reason, not garbage");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }

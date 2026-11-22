@@ -66,8 +66,14 @@ UiState uiFor(EngineState e) {
 
 void feedByteToLpt(uint8_t b) {
   if (!lpt.writeByte(b, LPT_BUSY_TIMEOUT_MS)) {
-    display.setError("ошибка LPT");
+    // BUSY never fell / ERROR or PE asserted mid-job for LPT_BUSY_TIMEOUT_MS.
+    // The current job is half-printed: keeping it in the queue would reprint
+    // the WHOLE job later (garbage); dropping loses the rest. Dropping is
+    // the safer default for a timeout - the operator can reprint from source.
+    queue.dropCurrent();
     engState = EngineState::IDLE;
+    display.setError("нет ответа LPT");
+    display.setState(uiFor(engState));
   }
 }
 
@@ -84,7 +90,8 @@ void pollButton() {
       net.forceAp();                          // STA down, AP up, retries off
       display.setState(UiState::AP_MODE);     // line 2 says "настройка" (not
       led.setMode(UiState::AP_MODE);          // "сеть не найдена") via isForcedAp()
-      btnDownSince = millis();                // debounce: re-arm after firing
+      btnDownSince = millis() - BTN_HOLD_MS + 500;   // re-arm: fire again every
+                                                     // 0.5 s while still held
     }
   } else {
     btnDownSince = 0;
@@ -131,23 +138,31 @@ void processQueue() {
     if (pwgFailed) {                     // broken raster: drop, keep serving
       queue.dropCurrent();
       pwgFailed = false; pwgActive = false;
-      display.setError("ошибка PWG");
+      // say WHY the page died: pwg.lastError() is "bad sync"/"bad header"/
+      // "line too wide"/"unsupported colorspace" - the serial log gets the
+      // exact reason, the OLED gets the short human text.
+      Serial.println(String("[pwg] dropped: ") + pwg.lastError());
+      display.setError("битый файл");
       engState = EngineState::IDLE;
       display.setState(uiFor(engState));
       return;
     }
+    if (engState != EngineState::PRINTING) return;   // feedByteToLpt dropped it
     int n = 0;
-    while (n < 512 && queue.hasData()) {
+    while (n < 512 && queue.hasData() && engState == EngineState::PRINTING) {
       int b = queue.readByte();
       if (b < 0) break;
       if (pwgActive) {
         if (!pwg.feed((uint8_t)b)) { pwgFailed = true; break; }
+        // pwgOut() already counts the CONVERTED bytes actually pushed to the
+        // port; counting the source bytes here too would double-increment.
       } else {
         feedByteToLpt((uint8_t)b);
+        printBytes++;
       }
-      printBytes++;
       n++;
     }
+    if (engState != EngineState::PRINTING) return;   // dropped mid-job above
     if (!queue.hasData() && !pwgFailed) {
       if (pwgActive) { pwg.end(); pwgActive = false; }
       engState = EngineState::IDLE;
@@ -308,7 +323,11 @@ void handleIpp(WiFiClient c) {
   bool spooling = (opId == 0x0002);   // Print-Job
   int slot = -1;
   if (spooling) {
+    // Check free space BEFORE accepting: without this the job would spool to
+    // a full flash, endJob would keep a truncated file and the print would
+    // come out cut mid-page with a success response to the client.
     for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
+    if (slot >= 0 && !queue.canStore()) slot = -1;   // disk full: refuse below
     if (slot >= 0) { queue.startJob(slot); rawActive[slot] = true; engState = EngineState::RECEIVING;
       display.setState(UiState::RECEIVING); }
   }
@@ -381,6 +400,11 @@ void handleIpp(WiFiClient c) {
   ippResp += (char)(status >> 8); ippResp += (char)(status & 255);
   ippResp += (char)((reqId >> 24) & 255); ippResp += (char)((reqId >> 16) & 255);
   ippResp += (char)((reqId >> 8) & 255); ippResp += (char)(reqId & 255);
+  // remember where the status-code bytes sit inside ippResp so a refusal
+  // (disk full) can patch them in place later - they follow the HTTP header
+  // ("\r\n\r\n") and the 2 version bytes.
+  const size_t ippBodyStart = ippResp.indexOf("\r\n\r\n") + 4;
+  const size_t statusOff = ippBodyStart + 2;
   ippResp += (char)0x01;                          // operation attributes tag
   attrStr(0x47, "attributes-charset", "utf-8");
   attrStr(0x48, "attributes-natural-language", "en-us");
@@ -432,9 +456,14 @@ void handleIpp(WiFiClient c) {
       attrStrMulti(0x44, "sides-supported", {"one-sided"});
       attrStr(0x44, "copies-default", "1");
       attrStr(0x44, "printer-up-time", String(millis() / 1000).c_str());
-      // pwg-raster-document-parameters Android looks for:
+      // pwg-raster-document-parameters Android looks for. A B&W printserver
+      // must advertise BOTH types (Michael Sweet's guidance on the PWG list,
+      // https://www.pwg.org/archives/ipp/2014/018345.html): black_1 (1-bit)
+      // and sgray_8 (8-bit gray) - whichever the client picks, the firmware
+      // decoder handles both (PwgToPcl). srgb_8 is also accepted (luma).
       attrStr(0x44, "pwg-raster-document-resolution-supported", "300dpi");
-      attrStr(0x44, "pwg-raster-document-type-supported", "black_1");
+      attrStrMulti(0x44, "pwg-raster-document-type-supported",
+                   {"black_1", "sgray_8", "srgb_8"});
       attrStr(0x44, "pwg-raster-document-sheet-back", "normal");
       attrStr(0x44, "printer-device-id", "MFG:ESP;MDL:PrintServer;CMD:PCL;");
       attrStrMulti(0x44, "printer-resolution-supported", {"300dpi"});
@@ -456,6 +485,15 @@ void handleIpp(WiFiClient c) {
       attrStr(0x42, "job-uri", ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/1").c_str());
     }
     ippResp += (char)0x03;                         // end-of-attributes
+    if (spooling && slot < 0) {
+      // refused BEFORE spooling (disk full / too many concurrent jobs):
+      // tell the client honestly instead of "OK" + a vanishing job.
+      // RFC 8011: 0x0503 = server-error-device-error; patch the two
+      // status bytes written above via substring (String has no writable
+      // operator[] in the host test stub, substring works everywhere).
+      ippResp = ippResp.substring(0, statusOff) + (char)0x05 + (char)0x03 +
+                ippResp.substring(statusOff + 2);
+    }
     // stream the document data (after the attr groups) into the spool.
     // Handles both Content-Length and chunked transfer, and knows the doc
     // format (isPwg) - PWG raster files get converted to PCL at print time.
