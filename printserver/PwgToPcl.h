@@ -108,19 +108,15 @@ public:
         px[pxIdx++] = b;
         if (pxIdx == hdrBpp) {             // got the pixel to repeat
           pxIdx = 0;
-          while (runLeft-- > 0 && colByte < hdrBytesLine) {
-            if (hdrBpc == 1) {
-              // black_1: the "pixel" is a packed byte of 8 pixels
-              // (1=white, MSB first) - copy it verbatim, finishLine()
-              // handles the bit unpacking. Thresholding it as a gray
-              // value would turn 0xAA (stripes) into plain white.
-              lineBuf[colByte++] = px[0];
-            } else {
-              // gray: use the (single) byte; rgb: average -> luma
-              uint8_t g = (hdrBpp == 1) ? px[0]
-                         : (uint8_t)((px[0] * 30 + px[1] * 59 + px[2] * 11) / 100);
-              lineBuf[colByte++] = g;
-            }
+          // Expand the RAW pixel bytes (hdrBpp per repetition) - finishLine()
+          // owns all depth conversion. Writing a pre-converted gray byte here
+          // used to store only 1 byte per pixel for srgb_8 while finishLine()
+          // reads 3 bytes per pixel: a repeat-coded colour row came out short
+          // (the line never completed) and garbled. black_1 is unaffected:
+          // its "pixel" is one packed byte (1=white, MSB first) copied
+          // verbatim - finishLine() handles the bit semantics.
+          while (runLeft-- > 0 && colByte + hdrBpp <= hdrBytesLine) {
+            for (uint32_t k = 0; k < hdrBpp; k++) lineBuf[colByte++] = px[k];
           }
           if (colByte >= hdrBytesLine) finishLine();
           else phase = Phase::LINE;
@@ -159,8 +155,12 @@ private:
   uint32_t outRow = 0;       // rows emitted (incl. repeats)
   uint32_t pages = 0, rowsOut = 0;
   const char* lastErr = nullptr;
-  // 1-bit PCL output row: 8 pixels per byte, MSB first
-  uint8_t pclRow[MAX_RASTER_WIDTH / 8 > 0 ? MAX_RASTER_WIDTH / 8 : 1];
+  // 1-bit PCL output row: 8 pixels per byte, MSB first.
+  // (MAX_RASTER_WIDTH + 7) / 8 = 319 B for 2550 px. The old
+  // MAX_RASTER_WIDTH / 8 truncated to 318 B, so the last byte of a
+  // full-width Letter (300 dpi) row wrote one byte past the end,
+  // silently corrupting the adjacent lineBuf.
+  uint8_t pclRow[(MAX_RASTER_WIDTH + 7) / 8 > 0 ? (MAX_RASTER_WIDTH + 7) / 8 : 1];
 
   bool put(uint8_t b) { return out ? out(ctx, b) : true; }
   bool puts(const char* s) { while (*s) if (!put((uint8_t)*s++)) return false; return true; }
@@ -177,11 +177,20 @@ private:
     hdrCs = be32(PWG_OFF_COLORSPACE);
     hdrResX = be32(PWG_OFF_HWRES_X); hdrResY = be32(PWG_OFF_HWRES_Y);
     if (!hdrW || !hdrH || !hdrBytesLine || !hdrBpp) return false;
+    // Pixel-width cap: the 1-bit OUTPUT row (pclRow) holds
+    // (MAX_RASTER_WIDTH+7)/8 bytes, so hdrW beyond MAX_RASTER_WIDTH would
+    // overflow it even when the packed INPUT line (hdrBytesLine, small for
+    // 1-bit pages: a 600 dpi A4 black_1 needs only 620 B) passes the
+    // lineBuf check below. We advertise 300 dpi in IPP; wider pages get an
+    // honest "line too wide" refusal instead of memory corruption.
+    if (hdrW > MAX_RASTER_WIDTH) {
+      lastErr = "line too wide";
+      return false;
+    }
     // The INPUT line buffer is the size that matters here (it was wrongly
     // checked against pclRow, the 1-bit OUTPUT row, so any page wider than
     // ~300 px was rejected - a full A4 300dpi page never stood a chance).
     if (hdrBytesLine > sizeof(lineBuf)) {          // input line too wide
-      // we threshold at 2400 px (300dpi x 8in); wider images get rejected
       lastErr = "line too wide";
       return false;
     }
@@ -291,6 +300,10 @@ private:
     }
   }
 
-  // gray line buffer: big enough for 2400 px at 1 byte/pixel
-  uint8_t lineBuf[MAX_RASTER_WIDTH];
+  // Input line buffer, worst case = full Letter width at 3 bytes/pixel
+  // (srgb_8, which IPP advertises in pwg-raster-document-type-supported):
+  // 2550 * 3 = 7650 B. 1-bit and 8-bit pages use a fraction of it. The old
+  // 1 byte/px sizing silently rejected every full-width srgb_8 page with
+  // "line too wide" AFTER the client had already started transferring.
+  uint8_t lineBuf[MAX_RASTER_WIDTH * 3];
 };

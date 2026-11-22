@@ -43,7 +43,12 @@ PrintQueue queue;
 NetService net;
 
 // ---------------- raw 9100 (JetDirect) ----------------
-#define MAX_RAW_CLIENTS 2
+// Spool slots shared by ALL inbound protocols: the raw 9100 accept loop AND
+// the IPP Print-Job handler pick their slot from the same rawActive[] array,
+// while the queue itself (PrintQueue) carries MAX_CONCURRENT_JOBS writers.
+// Hardcoding 2 here left slots 2..3 of the queue unreachable and made IPP
+// refuse a job whenever both raw slots were busy, despite spare capacity.
+#define MAX_RAW_CLIENTS MAX_CONCURRENT_JOBS
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClients[MAX_RAW_CLIENTS];
 bool rawActive[MAX_RAW_CLIENTS];
@@ -65,16 +70,21 @@ UiState uiFor(EngineState e) {
 }
 
 void feedByteToLpt(uint8_t b) {
-  if (!lpt.writeByte(b, LPT_BUSY_TIMEOUT_MS)) {
-    // BUSY never fell / ERROR or PE asserted mid-job for LPT_BUSY_TIMEOUT_MS.
-    // The current job is half-printed: keeping it in the queue would reprint
-    // the WHOLE job later (garbage); dropping loses the rest. Dropping is
-    // the safer default for a timeout - the operator can reprint from source.
-    queue.dropCurrent();
-    engState = EngineState::IDLE;
-    display.setError("нет ответа LPT");
-    display.setState(uiFor(engState));
-  }
+  if (lpt.writeByte(b, LPT_BUSY_TIMEOUT_MS)) return;
+  // BUSY never fell for the full timeout. Before dropping the half-printed
+  // job, try the one recovery the Centronics interface actually has: the
+  // INIT pulse (>= 50 us, IEEE 1284) resets the printer's interface logic
+  // and often recovers a hung BUSY. If the byte then goes through, the job
+  // continues seamlessly from this very byte.
+  lpt.resetPrinter();
+  if (lpt.writeByte(b, 2000)) return;   // INIT recovered it
+  // Still dead: the job is half-printed; keeping it in the queue would
+  // reprint the WHOLE job later (garbage). Dropping loses the rest - the
+  // operator can reprint from source.
+  queue.dropCurrent();
+  engState = EngineState::IDLE;
+  display.setError("нет ответа LPT");
+  display.setState(uiFor(engState));
 }
 
 // ---- BOOT button: hold BTN_HOLD_MS to force the configuration AP --------
@@ -147,7 +157,6 @@ void processQueue() {
       display.setState(uiFor(engState));
       return;
     }
-    if (engState != EngineState::PRINTING) return;   // feedByteToLpt dropped it
     int n = 0;
     while (n < 512 && queue.hasData() && engState == EngineState::PRINTING) {
       int b = queue.readByte();
@@ -520,8 +529,14 @@ void handleIpp(WiFiClient c) {
           chunkLeft -= n; remaining -= n;
           queue.write(slot, buf, n);
           if (chunkLeft == 0) {                    // consume trailing CRLF
-            while (c.available() < 2 && idle < 1000) { delay(1); }
-            c.read(); c.read();
+            // (bugfix) this wait never incremented its own timeout counter
+            // (idle stays 0), so a client stalling right after a chunk body
+            // spun here forever - watchdog reset mid-spool. Bounded wait;
+            // if the CRLF is still incomplete, end the spool gracefully.
+            uint32_t tCrlf = millis();
+            while (c.available() < 2 && millis() - tCrlf < 1000) { delay(1); }
+            if (c.available() >= 2) { c.read(); c.read(); }
+            else break;
             chunkHeaderPending = true;
           }
         } else {

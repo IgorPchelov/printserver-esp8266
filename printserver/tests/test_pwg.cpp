@@ -281,6 +281,171 @@ int main() {
           "CMYK raster rejected with a clear reason, not garbage");
   }
 
+  // ---------- regression: full-width Letter black_1 (pclRow sizing) ----------
+  // 2550 px @300dpi -> outBytes=(2550+7)/8=319. pclRow used to be
+  // MAX_RASTER_WIDTH/8 = 318 B: the last byte of each row wrote out of
+  // bounds into lineBuf and corrupted the row (visible as white specks).
+  {
+    outBytes.clear();
+    const uint32_t W = 2550, H = 2;            // US Letter width, 2 rows
+    std::vector<uint8_t> d6;
+    d6.push_back('R'); d6.push_back('a'); d6.push_back('S'); d6.push_back('2');
+    std::vector<uint8_t> h6(PWG_HDR_SIZE, 0);
+    auto pb6 = [&](uint16_t off, uint32_t val) {
+      h6[off] = val >> 24; h6[off+1] = val >> 16; h6[off+2] = val >> 8; h6[off+3] = val;
+    };
+    pb6(PWG_OFF_HWRES_X, 300); pb6(PWG_OFF_HWRES_Y, 300);
+    pb6(PWG_OFF_WIDTH, W); pb6(PWG_OFF_HEIGHT, H);
+    pb6(PWG_OFF_BPP, 1);                       // black_1
+    pb6(PWG_OFF_BYTESLINE, (W + 7) / 8);       // 319 packed bytes/row
+    pb6(PWG_OFF_COLORSPACE, 3);                // CUPS_CSPACE_K
+    memcpy(&h6[0], "PwgRaster", 9);
+    d6.insert(d6.end(), h6.begin(), h6.end());
+    for (uint32_t r = 0; r < H; r++) {
+      d6.push_back(0);                         // row appears once
+      d6.push_back(128);                       // fill whole line (K -> black)
+    }
+    PwgToPcl c6;
+    c6.begin(fakeLpt, nullptr);
+    bool ok6 = true;
+    for (uint8_t b : d6) if (!c6.feed(b)) { ok6 = false; break; }
+    CHECK(ok6, "Letter-width (2550 px) black_1 page accepted");
+    c6.end();
+    CHECK(c6.rowsPrinted() == H, "Letter black_1: both rows emitted");
+    std::string s6(outBytes.begin(), outBytes.end());
+    const std::string marker6 = "\x1b*b319W";
+    int rows6 = 0, bad6 = 0;
+    size_t p6 = 0;
+    while ((p6 = s6.find(marker6, p6)) != std::string::npos) {
+      p6 += marker6.size();
+      for (int i = 0; i < 319; i++) if (outBytes[p6 + i] != 0x00) bad6++;
+      rows6++;
+    }
+    CHECK(rows6 == 2, "Letter black_1: 319-byte transfer rows (full width)");
+    CHECK(bad6 == 0, "Letter black_1: all-black rows intact (no pclRow overflow)");
+  }
+
+  // ---------- regression: srgb_8 repeat-run (REP run unit) ----------
+  // A colour row coded as ONE repeat run (the common case for solid areas:
+  // Android's encoder loves these). REP used to store 1 gray byte per
+  // pixel while finishLine() reads 3 bytes/pixel: the line never completed
+  // and the row was silently lost (rows==0).
+  {
+    outBytes.clear();
+    const uint32_t W = 8, H = 1;
+    std::vector<uint8_t> d7;
+    d7.push_back('R'); d7.push_back('a'); d7.push_back('S'); d7.push_back('2');
+    std::vector<uint8_t> h7(PWG_HDR_SIZE, 0);
+    auto pb7 = [&](uint16_t off, uint32_t val) {
+      h7[off] = val >> 24; h7[off+1] = val >> 16; h7[off+2] = val >> 8; h7[off+3] = val;
+    };
+    pb7(PWG_OFF_HWRES_X, 300); pb7(PWG_OFF_HWRES_Y, 300);
+    pb7(PWG_OFF_WIDTH, W); pb7(PWG_OFF_HEIGHT, H);
+    pb7(PWG_OFF_BPP, 24);                      // srgb_8
+    pb7(PWG_OFF_BYTESLINE, W * 3);             // 24 bytes/row
+    pb7(PWG_OFF_COLORSPACE, 19);               // CUPS_CSPACE_SRGB
+    memcpy(&h7[0], "PwgRaster", 9);
+    d7.insert(d7.end(), h7.begin(), h7.end());
+    d7.push_back(0);                           // row appears once
+    d7.push_back(7);                           // ctl 0..127: repeat 8 pixels...
+    d7.push_back(0x00); d7.push_back(0x00); d7.push_back(0x00);  // ...of black
+    PwgToPcl c7;
+    c7.begin(fakeLpt, nullptr);
+    bool ok7 = true;
+    for (uint8_t b : d7) if (!c7.feed(b)) { ok7 = false; break; }
+    CHECK(ok7, "srgb_8 repeat-run row accepted");
+    c7.end();
+    CHECK(c7.rowsPrinted() == 1, "srgb_8 repeat-run: the row is not lost");
+    std::string s7(outBytes.begin(), outBytes.end());
+    size_t p7 = s7.find("\x1b*b1W");
+    CHECK(p7 != std::string::npos, "srgb_8 repeat-run: transfer row present");
+    if (p7 != std::string::npos)
+      CHECK(outBytes[p7 + 5] == 0x00, "srgb_8 repeat-run: black row decoded");
+  }
+
+  // ---------- regression: 600dpi A4 black_1 refused (output-row guard) ------
+  // hdrBytesLine=620 fits lineBuf (7650 B), but outBytes=620 would blow the
+  // 319-B pclRow. Must be refused by the hdrW check with "line too wide",
+  // not corrupt memory. (The server advertises 300 dpi only.)
+  {
+    outBytes.clear();
+    const uint32_t W = 4960, H = 1;            // A4 at 600 dpi
+    std::vector<uint8_t> d8;
+    d8.push_back('R'); d8.push_back('a'); d8.push_back('S'); d8.push_back('2');
+    std::vector<uint8_t> h8(PWG_HDR_SIZE, 0);
+    auto pb8 = [&](uint16_t off, uint32_t val) {
+      h8[off] = val >> 24; h8[off+1] = val >> 16; h8[off+2] = val >> 8; h8[off+3] = val;
+    };
+    pb8(PWG_OFF_HWRES_X, 600); pb8(PWG_OFF_HWRES_Y, 600);
+    pb8(PWG_OFF_WIDTH, W); pb8(PWG_OFF_HEIGHT, H);
+    pb8(PWG_OFF_BPP, 1);                       // black_1
+    pb8(PWG_OFF_BYTESLINE, (W + 7) / 8);       // 620 B - fits lineBuf
+    pb8(PWG_OFF_COLORSPACE, 3);
+    memcpy(&h8[0], "PwgRaster", 9);
+    d8.insert(d8.end(), h8.begin(), h8.end());
+    d8.push_back(0);
+    d8.push_back(128);
+    PwgToPcl c8;
+    c8.begin(fakeLpt, nullptr);
+    bool ok8 = true;
+    for (uint8_t b : d8) if (!c8.feed(b)) { ok8 = false; break; }
+    CHECK(!ok8 && !strcmp(c8.lastError(), "line too wide"),
+          "600dpi A4 black_1 refused honestly (would overflow pclRow)");
+  }
+
+  // ---------- regression: full-width srgb_8 accepted (lineBuf sizing) -------
+  // A4 at 300 dpi, 24 bpp: hdrBytesLine = 2480*3 = 7440 B. The old 2550-B
+  // lineBuf rejected this AFTER IPP advertised srgb_8 as supported - the
+  // client had already started transferring. lineBuf is 2550*3 now.
+  {
+    outBytes.clear();
+    const uint32_t W = 2480, H = 1;            // A4 at 300 dpi
+    std::vector<uint8_t> d9;
+    d9.push_back('R'); d9.push_back('a'); d9.push_back('S'); d9.push_back('2');
+    std::vector<uint8_t> h9(PWG_HDR_SIZE, 0);
+    auto pb9 = [&](uint16_t off, uint32_t val) {
+      h9[off] = val >> 24; h9[off+1] = val >> 16; h9[off+2] = val >> 8; h9[off+3] = val;
+    };
+    pb9(PWG_OFF_HWRES_X, 300); pb9(PWG_OFF_HWRES_Y, 300);
+    pb9(PWG_OFF_WIDTH, W); pb9(PWG_OFF_HEIGHT, H);
+    pb9(PWG_OFF_BPP, 24);                      // srgb_8
+    pb9(PWG_OFF_BYTESLINE, W * 3);             // 7440 B
+    pb9(PWG_OFF_COLORSPACE, 19);
+    memcpy(&h9[0], "PwgRaster", 9);
+    d9.insert(d9.end(), h9.begin(), h9.end());
+    d9.push_back(0);                           // row once
+    // whole 2480-px line as black repeat runs: 19 x 128 px + 48 px
+    uint32_t pxLeft = W;
+    while (pxLeft >= 128) {
+      d9.push_back(127);                       // repeat 128 px of one pixel
+      d9.push_back(0x00); d9.push_back(0x00); d9.push_back(0x00);
+      pxLeft -= 128;
+    }
+    if (pxLeft) {
+      d9.push_back(pxLeft - 1);                // repeat the remaining px
+      d9.push_back(0x00); d9.push_back(0x00); d9.push_back(0x00);
+    }
+    PwgToPcl c9;
+    c9.begin(fakeLpt, nullptr);
+    bool ok9 = true;
+    for (uint8_t b : d9) if (!c9.feed(b)) { ok9 = false; break; }
+    CHECK(ok9, "full-width srgb_8 A4 page accepted (lineBuf sized for 3 B/px)");
+    c9.end();
+    CHECK(c9.rowsPrinted() == 1, "full-width srgb_8: row emitted");
+    CHECK(!strcmp(c9.lastError(), ""), "full-width srgb_8: no error");
+    // the 2480-px row packs into 310 bytes, all black
+    std::string s9(outBytes.begin(), outBytes.end());
+    const std::string marker9 = "\x1b*b310W";
+    size_t p9 = s9.find(marker9);
+    CHECK(p9 != std::string::npos, "full-width srgb_8: 310-byte transfer row");
+    if (p9 != std::string::npos) {
+      p9 += marker9.size();
+      bool allBlack = true;
+      for (int i = 0; i < 310; i++) if (outBytes[p9 + i] != 0x00) allBlack = false;
+      CHECK(allBlack, "full-width srgb_8: whole black row decoded via repeats");
+    }
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }
