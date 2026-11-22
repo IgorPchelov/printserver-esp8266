@@ -144,7 +144,16 @@ bool PrintQueue::hasData() {
   if (!best) return false;
   curId = best;
   curIsPwg = bestIsPwg;
-  reader = LittleFS.open(jobPath(best, true) + (curIsPwg ? "w" : ""), "r");
+  String p = jobPath(best, true) + (curIsPwg ? "w" : "");
+  reader = LittleFS.open(p, "r");
+  if (!reader) {
+    // Listed but unopenable (littlefs corruption): remove it instead of
+    // picking the same lowest id on every hasData() call forever - a hot
+    // failed-open loop that starves loop().
+    LittleFS.remove(p);
+    if (pending > 0) pending--;
+    return false;
+  }
   curSize = reader.size();
   return reader && reader.available() > 0;
 }

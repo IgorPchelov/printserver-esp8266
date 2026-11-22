@@ -51,6 +51,12 @@ public:
   String& operator+=(const String& o) { _StdStr::append(o); return *this; }
   String& operator+=(const char* o) { _StdStr::append(o); return *this; }
   String& operator+=(char c) { _StdStr::push_back(c); return *this; }
+  // numeric overloads - without them `str += someUint32` binds to
+  // operator+=(char) and silently builds garbage (see host_littlefs shim)
+  String& operator+=(int v) { _StdStr::append(std::to_string(v)); return *this; }
+  String& operator+=(unsigned v) { _StdStr::append(std::to_string(v)); return *this; }
+  String& operator+=(long v) { _StdStr::append(std::to_string(v)); return *this; }
+  String& operator+=(unsigned long v) { _StdStr::append(std::to_string(v)); return *this; }
 };
 inline String operator+(const char* a, const String& b) { return String(a) + b; }
 inline bool operator==(const String& a, const char* b) { return a.compare(b) == 0; }

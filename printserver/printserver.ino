@@ -120,6 +120,11 @@ void syncLed() {
 PwgToPcl pwg;
 bool pwgActive = false;
 bool pwgFailed = false;
+// Job id the print engine currently works on. hasData() advances the reader
+// to the NEXT queued job (silently - it closes/removes the old file and
+// opens the new one inside the while-condition), so this id is compared on
+// every byte to detect job boundaries inside one 512-byte chunk.
+uint32_t engineJobId = 0;
 
 // callback: PCL output byte -> LPT. Same recovery as feedByteToLpt(): a hung
 // BUSY gets one INIT pulse + short retry; if that also fails, return false
@@ -133,6 +138,26 @@ bool pwgOut(void*, uint8_t b) {
   return lpt.writeByte(b, 2000);
 }
 
+// Set up (or tear down) the converters for the queue's CURRENT job. Called at
+// the IDLE->PRINTING start AND at every job boundary inside the byte loop:
+// the engine must never stream a new job through the previous job's setup -
+// a .okw arriving after a .ok used to go to the port raw (garbage pages),
+// and anything after a .okw hit the live decoder ("bad sync"/"bad header")
+// and was dropped. Only a single-job queue ever printed correctly.
+void engineSwitchJob() {
+  if (pwgActive) {                 // finish the converted job: raster end +
+    pwg.end();                     // form feed flush the last partial page
+    pwgActive = false;
+  }
+  engineJobId = queue.currentJobId();
+  if (queue.currentJobIsPwg()) {
+    pwg.begin(pwgOut, nullptr);    // fresh decoder state for the new job
+    pwgActive = true;
+    pwgFailed = false;
+    Serial.println("[pwg] job is image/pwg-raster -> converting to PCL");
+  }
+}
+
 void processQueue() {
   net.setBusy(engState != EngineState::IDLE);   // defer AP->STA switchover while a
                                                 // job is in flight (it would die)
@@ -140,11 +165,7 @@ void processQueue() {
   if (engState == EngineState::IDLE && queue.hasData()) {
     engState = EngineState::PRINTING;
     display.setState(UiState::PRINTING);
-    if (queue.currentJobIsPwg()) {                   // set up the converter
-      pwg.begin(pwgOut, nullptr);
-      pwgActive = true; pwgFailed = false;
-      Serial.println("[pwg] job is image/pwg-raster -> converting to PCL");
-    }
+    engineSwitchJob();                            // converters for job #1
   }
   if (engState == EngineState::PRINTING) {
     if (LptStatus st = lpt.status(); st == LptStatus::PAPER_OUT || st == LptStatus::ERROR_STATE) {
@@ -167,6 +188,12 @@ void processQueue() {
     }
     int n = 0;
     while (n < 512 && queue.hasData() && engState == EngineState::PRINTING) {
+      if (queue.currentJobId() != engineJobId) {
+        // hasData() just advanced the reader to the NEXT queued job (the old
+        // one is exhausted). Switch converters AT the boundary so the new
+        // job gets its own decoder/raw path - see engineSwitchJob().
+        engineSwitchJob();
+      }
       int b = queue.readByte();
       if (b < 0) break;
       if (pwgActive) {
@@ -204,8 +231,11 @@ void handleHttp(WiFiClient c) {
   String method = req.substring(0, sp);
   String path   = req.substring(sp + 1, sp2);
 
-  // drain headers
-  while (c.connected()) {
+  // drain headers. Line-capped: a client that drips a header line every
+  // ~0.9 s (broken TCP stack, slowloris-ish tool) would otherwise keep this
+  // loop alive indefinitely while c.connected() stays true - the box stops
+  // serving. Real requests carry well under 40 header lines.
+  for (int lines = 0; c.connected() && lines < 40; lines++) {
     String h = c.readStringUntil('\r'); c.readStringUntil('\n');
     if (h.length() == 0) break;
   }
@@ -314,7 +344,8 @@ void handleIpp(WiFiClient c) {
   bool chunked = false;
   bool expect100 = false;
   String reqLine = c.readStringUntil('\r'); c.readStringUntil('\n');
-  while (c.connected()) {
+  // Line-capped like handleHttp: see the comment there.
+  for (int lines = 0; c.connected() && lines < 40; lines++) {
     String h = c.readStringUntil('\r'); c.readStringUntil('\n');
     if (h.length() == 0) break;
     h.toLowerCase();
