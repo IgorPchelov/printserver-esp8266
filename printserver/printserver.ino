@@ -19,17 +19,20 @@
   * printserver.ino - ESP32-S3 generic LPT/Centronics WiFi print server.
   * Port of gianluca-nitti/printserver-esp8266 (GPLv3), heavily reworked.
   *
-  * Features:
-  *  [done] direct LPT drive w/ full status lines, OLED, WiFi/AP+web setup,
-  *         spool queue on LittleFS, Raw 9100, mDNS advertizing, IPP 1.1
-  *         Get-Printer-Attributes / Validate-Job / Print-Job;
-  *         PWG-raster (Android native print) decoded and converted to PCL
-  *         at print time (PwgToPcl.h); raw PCL/PJL jobs pass through.
-  */
+ * Features:
+ *  [done] direct LPT drive w/ full status lines, OLED, WiFi/AP+web setup,
+ *         spool queue on LittleFS, Raw 9100, mDNS advertizing, IPP 1.1
+ *         Get-Printer-Attributes / Validate-Job / Print-Job;
+ *         PWG-raster (Android native print) decoded and converted to PCL
+ *         at print time (PwgToPcl.h); raw PCL/PJL jobs pass through;
+ *         OTA firmware update from the web panel (/update, dual app slots).
+ */
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#include <Update.h>                     // OTA: write the uploaded bin into the
+                                        // idle app slot, then reboot into it
 #include "config.h"
 #include "ParallelPort.h"
 #include "StatusDisplay.h"
@@ -37,6 +40,7 @@
 #include "PrintQueue.h"
 #include "NetService.h"
 #include "PwgToPcl.h"
+#include "WebPages.h"
 
 ParallelPort lpt;
 StatusDisplay display;
@@ -237,10 +241,14 @@ void processQueue() {
 
 // ---------------- HTTP helpers ----------------
 String urlDecode(String str);   // from NetService.cpp
-void httpSend(WiFiClient& c, const String& type, const String& body) {
-  c.printf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: close\r\nContent-Length: %d\r\n\r\n",
-           type.c_str(), body.length());
+void httpSendCode(WiFiClient& c, int code, const char* text,
+                  const String& type, const String& body) {
+  c.printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nConnection: close\r\nContent-Length: %d\r\n\r\n",
+           code, text, type.c_str(), body.length());
   c.print(body);
+}
+void httpSend(WiFiClient& c, const String& type, const String& body) {
+  httpSendCode(c, 200, "OK", type, body);
 }
 
 void handleHttp(WiFiClient c) {
@@ -255,27 +263,45 @@ void handleHttp(WiFiClient c) {
   // ~0.9 s (broken TCP stack, slowloris-ish tool) would otherwise keep this
   // loop alive indefinitely while c.connected() stays true - the box stops
   // serving. Real requests carry well under 40 header lines.
+  // POST /update additionally needs two header values (the raw-body upload
+  // has no other way to learn its size / password), so those are captured
+  // while draining. Header names are case-insensitive (RFC 7230); values
+  // may carry one leading space.
+  long contentLen = -1;                 // POST /update: exact image size
+  String otaKey;                        // POST /update: X-OTA-Key value, if sent
   for (int lines = 0; c.connected() && lines < 40; lines++) {
     String h = c.readStringUntil('\r'); c.readStringUntil('\n');
     if (h.length() == 0) break;
+    if (method == "POST" && path == "/update") {
+      String hl = h; hl.toLowerCase();
+      if (hl.startsWith("content-length:")) contentLen = hl.substring(15).toInt();
+      else if (hl.startsWith("x-ota-key:")) {
+        int v = 10;                      // past "x-ota-key:", skip spaces
+        while (v < (int)h.length() && h.charAt(v) == ' ') v++;
+        otaKey = h.substring(v);
+      }
+    }
   }
 
   if (method == "GET" && (path == "/" || path == "/index.html")) {
     String body = String("<!DOCTYPE html><html><head><meta charset=utf-8>"
       "<meta name=viewport content='width=device-width,initial-scale=1'>"
-      "<title>") + PRINTER_NAME + "</title>"
+      "<title>") + PRINTER_NAME + " " + FIRMWARE_VERSION + "</title>"
       "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto;padding:0 1em}"
-      "h1{font-size:1.4em}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.4em}</style></head><body>"
+      "h1{font-size:1.4em}h2{font-size:1.1em}table{border-collapse:collapse;width:100%;margin:.4em 0 1em}"
+      "td,th{border:1px solid #ccc;padding:.4em}</style></head><body>"
       "<h1>" PRINTER_NAME "</h1>"
       "<table><tr><th>Состояние</th><td>" + lptStatusName(lpt.status()) + "</td></tr>"
       "<tr><th>Сеть</th><td>" + net.info() + "</td></tr>"
       "<tr><th>Заданий в очереди</th><td>" + String(queue.pendingCount()) + "</td></tr>"
       "<tr><th>Печатано байт</th><td>" + String(printBytes) + "</td></tr>"
-      "<tr><th>Очередь на флэше</th><td>" + String(queue.usedBytes()) + " Б</td></tr></table>"
-      "<p><a href='/wifi'>Настройка WiFi</a> &middot; печать: "
-      "socket://" + net.ip() + ":" + String(RAW_PORT) +
-      " &middot; ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp</p>"
-      "</body></html>";
+      "<tr><th>Очередь на флэше</th><td>" + String(queue.usedBytes()) + " Б</td></tr></table>";
+    // print endpoints: one endpoint per row (was one long line the user
+    // found hard to read) - see WebPages.h
+    body += printEndpointsTable(net.ip());
+    body += "<p><a href='/wifi'>Настройка WiFi</a> &middot; "
+            "<a href='/update'>Обновление прошивки</a></p>"
+            "</body></html>";
     httpSend(c, "text/html; charset=utf-8", body);
   } else if (method == "GET" && path == "/wifi") {
     // Wi-Fi setup page: scanned network list (click to pick) AND manual
@@ -346,6 +372,80 @@ void handleHttp(WiFiClient c) {
     display.tick();                               // connectTo() so the user sees it
     net.connectTo(ssid, pass, [] { lpt.poll(); display.tick(); syncLed(); led.tick(); pollButton(); delay(1); });
     display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
+  } else if (method == "GET" && path == "/update") {
+    // OTA page: file picker + progress bar; the actual upload logic lives
+    // in WebPages.h (page) and the POST branch below (flash write).
+    bool busy = engState != EngineState::IDLE || queue.pendingCount() > 0;
+    httpSend(c, "text/html; charset=utf-8",
+             otaPageHtml(busy, strlen(OTA_PASS) > 0, FIRMWARE_VERSION));
+  } else if (method == "POST" && path == "/update") {
+    // OTA flash write. The browser's XHR sends the .bin as the raw POST
+    // body with Content-Length - no multipart to parse. Design notes:
+    //  - refused while a job prints/spools (see otaPostGate in WebPages.h):
+    //    the flash write hogs the CPU for the whole transfer and the
+    //    post-success reboot would kill an in-flight job mid-page
+    //  - first byte must be 0xE9 (ESP image magic) - wrong file refused
+    //    early with a clear message, not after a full flash write
+    //  - the read loop pumps OLED/LED/LPT like the /wifi-connect pump, and
+    //    delay(1) feeds the task watchdog for the whole transfer
+    //  - Update.end(true) validates the image (checksum) before the
+    //    response is sent; only then ESP.restart() into the new slot
+    bool busy = engState != EngineState::IDLE || queue.pendingCount() > 0;
+    bool keyRequired = strlen(OTA_PASS) > 0;
+    bool keyOk = !keyRequired || otaKey == OTA_PASS;
+    int gate = otaPostGate(busy, keyRequired, keyOk, contentLen > 0);
+    if (gate != 200) {
+      const char* st = gate == 503 ? "Service Unavailable" :
+                       gate == 401 ? "Unauthorized" : "Bad Request";
+      httpSendCode(c, gate, st, "text/plain; charset=utf-8", String(otaGateText(gate)));
+    } else if (!Update.begin((size_t)contentLen)) {
+      // too big for the idle OTA slot (or flash layer trouble)
+      httpSendCode(c, 500, "Internal Server Error", "text/plain; charset=utf-8",
+                   String("Update.begin: ") + Update.errorString());
+    } else {
+      String fail;                       // "" until something goes wrong
+      uint8_t ubuf[2048];
+      long got = 0;
+      uint32_t idle = 0;                 // ms without a byte
+      bool magicChecked = false;
+      while (got < contentLen) {
+        int av = c.available();
+        if (av > 0) {
+          int n = c.read(ubuf, min((size_t)av, min((size_t)(contentLen - got), sizeof(ubuf))));
+          if (n <= 0) { fail = "обрыв приёма данных"; break; }
+          if (!magicChecked) {
+            magicChecked = true;
+            if (!otaMagicOk(ubuf[0])) { fail = "файл не похож на прошивку ESP32 (нет магического байта 0xE9)"; break; }
+          }
+          if (Update.write(ubuf, (size_t)n) != (size_t)n) {
+            fail = String("ошибка записи flash: ") + Update.errorString();
+            break;
+          }
+          got += n;
+          idle = 0;
+        } else {
+          delay(1);                       // yield: watchdog + stack
+          if (++idle > OTA_XFER_TIMEOUT_MS) { fail = "тайм-аут приёма (клиент пропал)"; break; }
+          // keep the panel alive during the multi-second transfer. The
+          // engine is idle here (the gate refused otherwise), and pollButton
+          // is deliberately NOT pumped: a long BOOT press would tear the
+          // radio down mid-flash-write.
+          lpt.poll(); display.tick(); led.tick();
+        }
+      }
+      if (fail.length() == 0 && got == contentLen && Update.end(true)) {
+        Serial.printf("[ota] %ld bytes written into the idle slot, rebooting\n", (long)contentLen);
+        httpSend(c, "text/plain; charset=utf-8", "OK. Прошивка записана, перезагрузка...");
+        delay(1000);                      // let the response reach the browser
+        ESP.restart();                    // boot into the new image
+      } else {
+        if (fail.length() == 0)
+          fail = String("Update.end: ") + Update.errorString();
+        Update.abort();                   // leave the running image untouched
+        Serial.println(String("[ota] failed: ") + fail);
+        httpSendCode(c, 500, "Internal Server Error", "text/plain; charset=utf-8", fail);
+      }
+    }
   } else {
     c.printf("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
   }

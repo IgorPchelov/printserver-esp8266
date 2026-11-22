@@ -15,7 +15,7 @@
 
 // ---------------------------------------------------------------- Version
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.1.0"
+#define FIRMWARE_VERSION "2.2.0"     // 2.2.0: web OTA update + endpoint column layout
 
 // ---------------------------------------------------------------- Hostname / names (generic, model-agnostic)
 #define HOST_NAME_PREFIX  "ESPPrint"   // hostname/mDNS prefix; full: ESPPrint-XXXX.local
@@ -103,6 +103,19 @@
 #define AP_RETRY_TIMEOUT_MS 10000UL  // give each background retry this long before
                                      // returning the radio to clean AP duty
 #define MDNS_TTL          120
+
+// ---------------------------------------------------------------- OTA web update (/update page)
+// POST /update streams the uploaded .bin straight into the idle OTA slot
+// (app0/app1, 4 MB each - see partitions-16mb.csv) and reboots. The FIRST
+// flash of a new board still has to go over USB: OTA only updates a box
+// that already runs this firmware.
+#define OTA_PASS          ""     // optional password for the /update POST. Empty =
+                                 // open update (same trust model as the /wifi page:
+                                 // trusted LAN). Set a non-empty string and the page
+                                 // asks for it (sent as the X-OTA-Key header).
+#define OTA_XFER_TIMEOUT_MS 20000UL // upload stall: no byte for this long = dead
+                                    // client, abort the flash write cleanly. Bytes
+                                    // flowing reset it, so a slow WiFi link is fine.
 
 // ---------------------------------------------------------------- Print queue (LittleFS)
 #define QUEUE_FILES_PREFIX "/q/"             // directory for spooled jobs

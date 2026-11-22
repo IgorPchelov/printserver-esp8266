@@ -5,6 +5,8 @@
 #                in RAM (host_littlefs/ shim, littlefs v2.9 vendored)
 #   test_scroll- OLED ping-pong scroll trajectory (StatusDisplay.cpp linked
 #                against the host_syntax stubs)
+#   test_web  - web panel page builders (WebPages.h): OTA /update page,
+#                one-endpoint-per-row table, POST /update refusal rules
 #   syntax     - g++ -fsyntax-only of every firmware module via stubs
 #                (host_syntax/), so .ino edits are compile-checked too
 cd "$(dirname "$0")"
@@ -25,6 +27,10 @@ g++ -std=c++17 -w -I. -I.. -Ihost_syntax/stubs -o test_scroll \
     test_scroll.cpp ../StatusDisplay.cpp ../ParallelPort.cpp \
     ../NetService.cpp host_syntax/stubs/stub_globals.cpp && \
     ./test_scroll || rc=1
+
+echo "== Web panel page tests =="
+g++ -std=c++17 -w -I. -I.. -Ihost_syntax/stubs -o test_web \
+    test_web.cpp && ./test_web || rc=1
 
 echo "== firmware syntax check =="
 for f in printserver.ino ParallelPort.cpp PrintQueue.cpp NetService.cpp \

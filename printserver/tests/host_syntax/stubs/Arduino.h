@@ -36,8 +36,10 @@ public:
   char charAt(unsigned i) const { return (*this)[i]; }
   int indexOf(char c) const { auto p = _StdStr::find(c); return p == npos ? -1 : (int)p; }
   int indexOf(const char* s) const { auto p = _StdStr::find(s); return p == npos ? -1 : (int)p; }
+  int indexOf(const char* s, unsigned from) const { auto p = _StdStr::find(s, from); return p == npos ? -1 : (int)p; }
   int lastIndexOf(char c) const { auto p = _StdStr::rfind(c); return p == npos ? -1 : (int)p; }
   int lastIndexOf(const char* s) const { auto p = _StdStr::rfind(s); return p == npos ? -1 : (int)p; }
+  int lastIndexOf(const char* s, unsigned from) const { auto p = _StdStr::rfind(s, from); return p == npos ? -1 : (int)p; }
   String substring(unsigned a) const { return String(_StdStr::substr(a)); }
   String substring(unsigned a, unsigned b) const { return String(_StdStr::substr(a, b - a)); }
   bool startsWith(const char* s) const { return _StdStr::compare(0, strlen(s), s) == 0; }
@@ -84,6 +86,7 @@ class EspClass {
 public:
   uint64_t getEfuseMac() { return 0; }
   uint32_t getFreeHeap() { return 0; }
+  void restart() {}                       // OTA path: ESP.restart() after Update.end
 };
 extern EspClass ESP;
 
