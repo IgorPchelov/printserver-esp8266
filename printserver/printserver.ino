@@ -269,6 +269,7 @@ void handleHttp(WiFiClient c) {
   // may carry one leading space.
   long contentLen = -1;                 // POST /update: exact image size
   String otaKey;                        // POST /update: X-OTA-Key value, if sent
+  bool otaExpect100 = false;            // POST /update: Expect: 100-Continue (curl)
   for (int lines = 0; c.connected() && lines < 40; lines++) {
     String h = c.readStringUntil('\r'); c.readStringUntil('\n');
     if (h.length() == 0) break;
@@ -280,6 +281,8 @@ void handleHttp(WiFiClient c) {
         while (v < (int)h.length() && h.charAt(v) == ' ') v++;
         otaKey = h.substring(v);
       }
+      else if (hl.startsWith("expect:") && hl.indexOf("100-continue") >= 0)
+        otaExpect100 = true;             // same handling as handleIpp below
     }
   }
 
@@ -290,12 +293,13 @@ void handleHttp(WiFiClient c) {
       "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto;padding:0 1em}"
       "h1{font-size:1.4em}h2{font-size:1.1em}table{border-collapse:collapse;width:100%;margin:.4em 0 1em}"
       "td,th{border:1px solid #ccc;padding:.4em}</style></head><body>"
-      "<h1>" PRINTER_NAME "</h1>"
-      "<table><tr><th>Состояние</th><td>" + lptStatusName(lpt.status()) + "</td></tr>"
-      "<tr><th>Сеть</th><td>" + net.info() + "</td></tr>"
-      "<tr><th>Заданий в очереди</th><td>" + String(queue.pendingCount()) + "</td></tr>"
-      "<tr><th>Печатано байт</th><td>" + String(printBytes) + "</td></tr>"
-      "<tr><th>Очередь на флэше</th><td>" + String(queue.usedBytes()) + " Б</td></tr></table>";
+      "<h1>" PRINTER_NAME "</h1>";
+    // status table with the firmware version as its first row (the user
+    // needs to see which build the box runs - especially with OTA updates)
+    // - see WebPages.h
+    body += indexStatusTable(lptStatusName(lpt.status()), net.info(),
+                             queue.pendingCount(), printBytes,
+                             queue.usedBytes(), FIRMWARE_VERSION);
     // print endpoints: one endpoint per row (was one long line the user
     // found hard to read) - see WebPages.h
     body += printEndpointsTable(net.ip());
@@ -324,6 +328,7 @@ void handleHttp(WiFiClient c) {
       "Пароль: <input type=password name=password maxlength=64><br>"
       "<button>Подключить</button></form>"
       "<p>Текущее: " + net.info() + "</p>"
+      "<p class=hint>Версия прошивки: " FIRMWARE_VERSION "</p>"
       "<script>"
       // poll every second until the scan is done, then render the list
       "function load(){fetch('/scan').then(r=>r.json()).then(a=>{"
@@ -386,8 +391,9 @@ void handleHttp(WiFiClient c) {
     //    post-success reboot would kill an in-flight job mid-page
     //  - first byte must be 0xE9 (ESP image magic) - wrong file refused
     //    early with a clear message, not after a full flash write
-    //  - the read loop pumps OLED/LED/LPT like the /wifi-connect pump, and
-    //    delay(1) feeds the task watchdog for the whole transfer
+    //  - the read loop yields with delay(1) (task watchdog) and polls only
+    //    the LPT GPIO lines - no OLED/LED updates during flash writes, see
+    //    the comment inside the loop
     //  - Update.end(true) validates the image (checksum) before the
     //    response is sent; only then ESP.restart() into the new slot
     bool busy = engState != EngineState::IDLE || queue.pendingCount() > 0;
@@ -398,52 +404,69 @@ void handleHttp(WiFiClient c) {
       const char* st = gate == 503 ? "Service Unavailable" :
                        gate == 401 ? "Unauthorized" : "Bad Request";
       httpSendCode(c, gate, st, "text/plain; charset=utf-8", String(otaGateText(gate)));
-    } else if (!Update.begin((size_t)contentLen)) {
-      // too big for the idle OTA slot (or flash layer trouble)
-      httpSendCode(c, 500, "Internal Server Error", "text/plain; charset=utf-8",
-                   String("Update.begin: ") + Update.errorString());
     } else {
-      String fail;                       // "" until something goes wrong
-      uint8_t ubuf[2048];
-      long got = 0;
-      uint32_t idle = 0;                 // ms without a byte
-      bool magicChecked = false;
-      while (got < contentLen) {
-        int av = c.available();
-        if (av > 0) {
-          int n = c.read(ubuf, min((size_t)av, min((size_t)(contentLen - got), sizeof(ubuf))));
-          if (n <= 0) { fail = "обрыв приёма данных"; break; }
-          if (!magicChecked) {
-            magicChecked = true;
-            if (!otaMagicOk(ubuf[0])) { fail = "файл не похож на прошивку ESP32 (нет магического байта 0xE9)"; break; }
-          }
-          if (Update.write(ubuf, (size_t)n) != (size_t)n) {
-            fail = String("ошибка записи flash: ") + Update.errorString();
-            break;
-          }
-          got += n;
-          idle = 0;
-        } else {
-          delay(1);                       // yield: watchdog + stack
-          if (++idle > OTA_XFER_TIMEOUT_MS) { fail = "тайм-аут приёма (клиент пропал)"; break; }
-          // keep the panel alive during the multi-second transfer. The
-          // engine is idle here (the gate refused otherwise), and pollButton
-          // is deliberately NOT pumped: a long BOOT press would tear the
-          // radio down mid-flash-write.
-          lpt.poll(); display.tick(); led.tick();
-        }
-      }
-      if (fail.length() == 0 && got == contentLen && Update.end(true)) {
-        Serial.printf("[ota] %ld bytes written into the idle slot, rebooting\n", (long)contentLen);
-        httpSend(c, "text/plain; charset=utf-8", "OK. Прошивка записана, перезагрузка...");
-        delay(1000);                      // let the response reach the browser
-        ESP.restart();                    // boot into the new image
+      // gate passed: unblock a curl that waits for 100-Continue before
+      // sending its body (browsers never ask, this is curl/headless only).
+      // Sent only AFTER the gate - a refused request gets the final status
+      // immediately and the body is never transferred.
+      if (otaExpect100) c.print("HTTP/1.1 100 Continue\r\n\r\n");
+      if (!Update.begin((size_t)contentLen)) {
+        // too big for the idle OTA slot (or flash layer trouble)
+        httpSendCode(c, 500, "Internal Server Error", "text/plain; charset=utf-8",
+                     String("Update.begin: ") + Update.errorString());
       } else {
-        if (fail.length() == 0)
-          fail = String("Update.end: ") + Update.errorString();
-        Update.abort();                   // leave the running image untouched
-        Serial.println(String("[ota] failed: ") + fail);
-        httpSendCode(c, 500, "Internal Server Error", "text/plain; charset=utf-8", fail);
+        String fail;                       // "" until something goes wrong
+        uint8_t ubuf[2048];
+        long got = 0;
+        uint32_t idle = 0;                 // ms without a byte
+        bool magicChecked = false;
+        while (got < contentLen) {
+          int av = c.available();
+          if (av > 0) {
+            int n = c.read(ubuf, min((size_t)av, min((size_t)(contentLen - got), sizeof(ubuf))));
+            if (n <= 0) { fail = "обрыв приёма данных"; break; }
+            if (!magicChecked) {
+              magicChecked = true;
+              if (!otaMagicOk(ubuf[0])) { fail = "файл не похож на прошивку ESP32 (нет магического байта 0xE9)"; break; }
+            }
+            if (Update.write(ubuf, (size_t)n) != (size_t)n) {
+              fail = String("ошибка записи flash: ") + Update.errorString();
+              break;
+            }
+            got += n;
+            idle = 0;
+          } else {
+            // dead peer fast-fail: connected() stays true while data is still
+            // buffered, so reaching here with it false means the socket is
+            // gone AND everything sent was consumed - no point waiting out
+            // the full OTA_XFER_TIMEOUT_MS for a client that already left.
+            if (!c.connected()) { fail = "обрыв соединения"; break; }
+            delay(1);                       // yield: watchdog + stack
+            if (++idle > OTA_XFER_TIMEOUT_MS) { fail = "тайм-аут приёма (клиент пропал)"; break; }
+            // Deliberately NO display.tick()/led.tick() in this loop, unlike
+            // the /wifi-connect pump: Update.write() opens flash erase/
+            // program windows with the cache off and interrupts restricted,
+            // and the WS2812 (RMT) / OLED (I2C) drivers do not guarantee
+            // IRAM-safe ISRs - one firing mid-erase can panic the box.
+            // The panel simply holds its last state for the few seconds of
+            // the upload. LPT polling is pure GPIO reads (safe) and keeps
+            // the "printer unplugged" detection live. pollButton is skipped
+            // for the same radio reason as before.
+            lpt.poll();
+          }
+        }
+        if (fail.length() == 0 && got == contentLen && Update.end(true)) {
+          Serial.printf("[ota] %ld bytes written into the idle slot, rebooting\n", (long)contentLen);
+          httpSend(c, "text/plain; charset=utf-8", "OK. Прошивка записана, перезагрузка...");
+          delay(1000);                      // let the response reach the browser
+          ESP.restart();                    // boot into the new image
+        } else {
+          if (fail.length() == 0)
+            fail = String("Update.end: ") + Update.errorString();
+          Update.abort();                   // leave the running image untouched
+          Serial.println(String("[ota] failed: ") + fail);
+          httpSendCode(c, 500, "Internal Server Error", "text/plain; charset=utf-8", fail);
+        }
       }
     }
   } else {

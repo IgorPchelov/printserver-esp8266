@@ -5,12 +5,31 @@
  * progress, busy lock, optional password) and the index print-endpoint
  * table (one endpoint per row - the user found the old single line hard
  * to read) live here as free functions with no hardware dependencies.
+ * The index status table (with the firmware version as its first row)
+ * also lives here: with OTA updates flying around, the panel must answer
+ * "which build is this box running?" at a glance.
  *
  * This file is part of printserver-esp8266 (GPLv3), see printserver.ino.
  */
 #pragma once
 
-#include "config.h"      // String (via Arduino.h), RAW_PORT / IPP_PORT / OTA_PASS
+#include "config.h"      // String (via Arduino.h), FIRMWARE_VERSION / RAW_PORT / IPP_PORT
+
+// ---- index page: status table, firmware version as the FIRST row --------
+// Versioning convention (user request): EVERY change to the firmware bumps
+// FIRMWARE_VERSION in config.h (minor for notable features, patch for small
+// tweaks/fixes) - that is what makes this row able to tell builds apart.
+inline String indexStatusTable(const char* status, const String& netInfo,
+                               int pending, unsigned long printed,
+                               unsigned long used, const char* version) {
+  return String("<table><tr><th>Версия прошивки</th><td>") + version
+       + "</td></tr><tr><th>Состояние</th><td>" + status
+       + "</td></tr><tr><th>Сеть</th><td>" + netInfo
+       + "</td></tr><tr><th>Заданий в очереди</th><td>" + String(pending)
+       + "</td></tr><tr><th>Печатано байт</th><td>" + String(printed)
+       + "</td></tr><tr><th>Очередь на флэше</th><td>" + String(used) + " Б"
+       + "</td></tr></table>";
+}
 
 // ---- index page: print endpoints, one endpoint per table row -------------
 // Was one long paragraph line: "печать: socket://ip:9100 · ipp://ip:631/lp".

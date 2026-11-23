@@ -35,6 +35,7 @@ public:
   unsigned length() const { return (unsigned)_StdStr::size(); }
   char charAt(unsigned i) const { return (*this)[i]; }
   int indexOf(char c) const { auto p = _StdStr::find(c); return p == npos ? -1 : (int)p; }
+  int indexOf(char c, unsigned from) const { auto p = _StdStr::find(c, from); return p == npos ? -1 : (int)p; }
   int indexOf(const char* s) const { auto p = _StdStr::find(s); return p == npos ? -1 : (int)p; }
   int indexOf(const char* s, unsigned from) const { auto p = _StdStr::find(s, from); return p == npos ? -1 : (int)p; }
   int lastIndexOf(char c) const { auto p = _StdStr::rfind(c); return p == npos ? -1 : (int)p; }

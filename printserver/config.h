@@ -14,8 +14,13 @@
 #include <Arduino.h>
 
 // ---------------------------------------------------------------- Version
+// CONVENTION (user request): every change to the firmware bumps this - the
+// web panel (index page first status row, /wifi footer, /update page) shows
+// it, so anyone can tell which build a flashed box is running. Minor for
+// notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.2.0"     // 2.2.0: web OTA update + endpoint column layout
+#define FIRMWARE_VERSION "2.2.1"     // 2.2.1: version shown on the web panel;
+                                    // 2.2.0: web OTA update + endpoint column layout
 
 // ---------------------------------------------------------------- Hostname / names (generic, model-agnostic)
 #define HOST_NAME_PREFIX  "ESPPrint"   // hostname/mDNS prefix; full: ESPPrint-XXXX.local

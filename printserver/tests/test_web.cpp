@@ -1,7 +1,10 @@
 // test_web.cpp - host regression test for the web panel page builders
 // (WebPages.h).
 //
-// Covers the two user-facing requirements and the OTA refusal rules:
+// Covers the user-facing requirements and the OTA refusal rules:
+//   - index page: firmware version as the FIRST status row (so a flashed
+//     box always answers "which build am I running?"), with the version
+//     convention guarded: FIRMWARE_VERSION must stay X.Y.Z
 //   - index page: raw 9100 / IPP endpoints shown ONE PER TABLE ROW (was a
 //     single line "socket://ip:9100 · ipp://ip:631/lp" the user found
 //     hard to read)
@@ -33,7 +36,42 @@ static bool insideRow(const String& html, const char* needle, int row) {
   return p > r && p < rEnd;
 }
 
+// count how many <tr> rows the table has
+static int rowCount(const String& html) {
+  int n = 0, p = -1;
+  while ((p = html.indexOf("<tr>", p + 1)) >= 0) n++;
+  return n;
+}
+
 int main() {
+  // ---------- index status table: version as the first row ----------
+  String st = indexStatusTable("готов", "Home IP=192.168.1.45 RSSI=-52dBm",
+                               7, 123456UL, 789UL, "9.9.9");
+  CHECK(rowCount(st) == 6, "status: 6 rows (version + 5 status lines)");
+  CHECK(insideRow(st, "9.9.9", 0), "status: version value in row 1");
+  CHECK(insideRow(st, "Версия прошивки", 0), "status: row 1 labeled 'Версия прошивки'");
+  CHECK(insideRow(st, "готов", 1), "status: printer state in row 2");
+  CHECK(insideRow(st, "RSSI=-52dBm", 2), "status: network info in row 3");
+  CHECK(insideRow(st, ">7<", 3), "status: pending jobs count in row 4");
+  CHECK(insideRow(st, "123456", 4), "status: printed bytes in row 5");
+  CHECK(insideRow(st, "789 Б", 5), "status: spool bytes in row 6");
+  CHECK(st.indexOf("9.9.9") < st.indexOf("готов"), "status: version row above state row");
+  CHECK(indexStatusTable("готов", "net", 0, 0, 0, FIRMWARE_VERSION)
+          .indexOf(FIRMWARE_VERSION) > 0,
+        "status: builder renders the live FIRMWARE_VERSION");
+
+  // ---------- versioning convention: X.Y.Z, bumped every change ----------
+  String v = String(FIRMWARE_VERSION);
+  int d1 = v.indexOf('.');
+  int d2 = v.indexOf('.', (unsigned)(d1 + 1));
+  CHECK(d1 > 0 && d2 > d1, "version: X.Y.Z shape (two dots)");
+  CHECK(v.indexOf('.', (unsigned)(d2 + 1)) < 0, "version: exactly two dots");
+  bool digits = true;
+  for (unsigned i = 0; i < v.length() && digits; i++)
+    if (v.charAt(i) != '.' && (v.charAt(i) < '0' || v.charAt(i) > '9')) digits = false;
+  CHECK(digits, "version: digits and dots only");
+  CHECK(v != "2.2.0" && v != "2.1.0", "version: bumped past the previous releases");
+
   // ---------- print endpoints: one endpoint per row ----------
   String t = printEndpointsTable(String("10.0.0.42"));
   CHECK(t.indexOf("socket://10.0.0.42:9100") > 0, "endpoints: raw socket URI with ip+port");
