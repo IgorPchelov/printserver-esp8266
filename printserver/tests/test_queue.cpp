@@ -207,6 +207,29 @@ int main() {
           "queue healthy after the overflow");
   }
 
+  // ---------- group 9: jobId() accessor (IPP job-id/job-uri regression) ----
+  // The IPP Print-Job response quotes the REAL spool id via jobId(): a
+  // hardcoded 1 used to point at a phantom /job/1 that could collide with
+  // a genuinely spooled job #1. Pin the accessor's contract: live while the
+  // writer is open, zero after endJob, and unique across concurrent slots.
+  lfsGlueFormat();
+  {
+    PrintQueue q;
+    q.begin();
+    spool(q, 0, "one", false);               // job 1 (spool() opens+closes)
+    CHECK(q.jobId(0) == 0, "jobId: closed slot reports 0");
+    CHECK(q.startJob(1) && q.jobId(1) == 2, "jobId: live writer reports its id");
+    CHECK(q.startJob(2) && q.jobId(2) == 3, "jobId: second concurrent slot distinct");
+    CHECK(q.jobId(3) == 0, "jobId: never-opened slot reports 0");
+    // give both writers data: an EMPTY job is discarded by endJob() by
+    // design (group 5) - that path must not be confused with a broken one
+    q.write(1, (const uint8_t*)"x", 1);
+    q.write(2, (const uint8_t*)"y", 1);
+    CHECK(q.endJob(1, false) && q.endJob(2, false), "both finalize");
+    CHECK(q.jobId(1) == 0 && q.jobId(2) == 0, "jobId: back to 0 after endJob");
+    CHECK(!q.jobId(4) && !q.jobId(-1), "jobId: out-of-range slot rejected");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL QUEUE TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }

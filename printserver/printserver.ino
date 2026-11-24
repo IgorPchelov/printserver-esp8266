@@ -129,6 +129,22 @@ void syncLed() {
                    lpt.status() == LptStatus::ERROR_STATE);
 }
 
+// Panel keep-alive for code paths that BLOCK loop() for seconds (the wifi
+// join waits, the IPP transfer loops): OLED, LED, LPT polling and the BOOT
+// button all stay serviced while a handler sits in a read loop. NOT called
+// from the OTA flash-write loop - see the comment there (RMT/I2C activity
+// during Update.write() erase windows); LittleFS page writes from the
+// spoolers are short, and loop() itself already interleaves them with the
+// panel ticks.
+void panelPump() {
+  lpt.poll();
+  display.tick();
+  syncLed();
+  led.tick();
+  pollButton();
+  delay(1);
+}
+
 // ---- PWG->PCL conversion state (active when queue.currentJobIsPwg()) ----
 PwgToPcl pwg;
 bool pwgActive = false;
@@ -375,7 +391,7 @@ void handleHttp(WiFiClient c) {
     delay(500);
     display.setState(UiState::WIFI_CONNECTING);   // repaint before the blocking
     display.tick();                               // connectTo() so the user sees it
-    net.connectTo(ssid, pass, [] { lpt.poll(); display.tick(); syncLed(); led.tick(); pollButton(); delay(1); });
+    net.connectTo(ssid, pass, panelPump);
     display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
   } else if (method == "GET" && path == "/update") {
     // OTA page: file picker + progress bar; the actual upload logic lives
@@ -501,11 +517,15 @@ void handleIpp(WiFiClient c) {
   if (expect100) c.print("HTTP/1.1 100 Continue\r\n\r\n");
 
   // IPP body: version(2) op(2) reqid(4) attr-groups...
+  // Every wait below pumps panelPump(): an Android PWG job runs for tens of
+  // seconds, and without it the OLED freezes mid-frame, the BOOT button
+  // ignores a hold and the LPT status lines stop being polled for exactly
+  // the duration of the transfer.
   uint8_t hdr[8];
   size_t got = 0;
   uint32_t t0 = millis();
   while (got < 8 && millis() - t0 < 5000) {
-    if (c.available()) hdr[got++] = c.read(); else delay(1);
+    if (c.available()) hdr[got++] = c.read(); else panelPump();
   }
   if (got < 8) { c.stop(); return; }
   uint16_t opId = (hdr[2] << 8) | hdr[3];
@@ -547,7 +567,7 @@ void handleIpp(WiFiClient c) {
       while ((b = c.available()) == 0) {
         if (millis() - tWalk > 10000) break;
         if (!c.connected()) break;
-        delay(1);
+        panelPump();               // keep OLED/LED/LPT/button alive (see above)
       }
       if (b <= 0 && !c.available()) break;
       int tag = c.read();
@@ -556,19 +576,19 @@ void handleIpp(WiFiClient c) {
       if (tag < 0x10) break;                        // out of spec; bail to data
       // value-tag: read name-len, name, value-len, value
       auto readU16 = [&]() -> uint16_t {
-        while (c.available() < 2 && millis() - tWalk < 10000) delay(1);
+        while (c.available() < 2 && millis() - tWalk < 10000) panelPump();
         if (c.available() < 2) return 0xFFFF;
         uint16_t hi = c.read(); return (hi << 8) | c.read();
       };
       uint16_t nlen = readU16();
       String name;
       if (nlen != 0 && nlen != 0xFFFF) {
-        while (c.available() < nlen && millis() - tWalk < 10000) delay(1);
+        while (c.available() < nlen && millis() - tWalk < 10000) panelPump();
         for (uint16_t i = 0; i < nlen && c.available(); i++) name += (char)c.read();
       }
       uint16_t vlen = readU16();
       if (vlen != 0xFFFF) {
-        while (c.available() < vlen && millis() - tWalk < 10000) delay(1);
+        while (c.available() < vlen && millis() - tWalk < 10000) panelPump();
         String val;
         for (uint16_t i = 0; i < vlen && c.available(); i++) val += (char)c.read();
         if (inOpGroup && name == "document-format") docFormat = val;
@@ -687,11 +707,14 @@ void handleIpp(WiFiClient c) {
       attrStr(0x44, "printer-device-id", "MFG:ESP;MDL:PrintServer;CMD:PCL;");
       attrStrMulti(0x44, "printer-resolution-supported", {"300dpi"});
     } else if (opId == 0x0002) {
+      // REAL spool id (see PrintQueue::jobId): a hardcoded 1 pointed at a
+      // phantom /job/1 that could collide with a truly spooled job #1.
+      uint32_t jid = slot >= 0 ? queue.jobId(slot) : 0;
       ippResp += (char)0x02;                       // job attributes tag
-      attrInt(0x21, "job-id", 1);                  // integer
+      attrInt(0x21, "job-id", jid);                // integer
       attrInt(0x23, "job-state", 3);               // enum: 3 = pending
       attrStr(0x44, "job-state-reasons", "none");
-      attrStr(0x42, "job-uri", ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/1").c_str());
+      attrStr(0x42, "job-uri", ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/" + String(jid)).c_str());
     }
     ippResp += (char)0x03;                         // end-of-attributes
     bool stored = true;                            // endJob verdict (below)
@@ -710,7 +733,7 @@ void handleIpp(WiFiClient c) {
       bool sawTerminal = false;         // chunked: the 0-size terminal chunk arrived
       while (c.connected() && idle < 10000) {
         int av = c.available();
-        if (av <= 0) { idle += 10; delay(10); continue; }
+        if (av <= 0) { idle += 10; panelPump(); continue; }   // see header comment
         idle = 0;
         if (chunked) {
           if (chunkHeaderPending) {
@@ -730,7 +753,7 @@ void handleIpp(WiFiClient c) {
             // spun here forever - watchdog reset mid-spool. Bounded wait;
             // if the CRLF is still incomplete, end the spool gracefully.
             uint32_t tCrlf = millis();
-            while (c.available() < 2 && millis() - tCrlf < 1000) { delay(1); }
+            while (c.available() < 2 && millis() - tCrlf < 1000) panelPump();
             if (c.available() >= 2) { c.read(); c.read(); }
             else { truncated = true; break; }
             chunkHeaderPending = true;
@@ -800,7 +823,7 @@ void setup() {
   lpt.begin();
   queue.begin();
   net.begin();                           // non-blocking join with stored credentials
-  net.waitConnected([] { lpt.poll(); display.tick(); syncLed(); led.tick(); pollButton(); delay(1); });
+  net.waitConnected(panelPump);
   display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
 
   rawServer.begin();

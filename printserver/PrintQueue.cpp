@@ -118,6 +118,11 @@ bool PrintQueue::endJob(int clientId, bool cancel) {
   return finalized;
 }
 
+uint32_t PrintQueue::jobId(int clientId) const {
+  if (clientId < 0 || clientId >= MAX_CONCURRENT_JOBS || !writers[clientId]) return 0;
+  return writerIds[clientId];
+}
+
 bool PrintQueue::hasData() {
   if (reader && reader.available() > 0) return true;
   if (reader) {

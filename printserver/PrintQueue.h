@@ -32,6 +32,11 @@ public:
   // removed - a truncated file must never print as a half page.
   bool endJob(int clientId, bool cancel);
   bool canStore();                           // flash space available
+  // Spool id of the job being written on this slot (0 = no open writer).
+  // The IPP Print-Job response quotes it as the REAL job-id/job-uri - a
+  // hardcoded 1 referenced a phantom /job/1 that could collide with a
+  // genuinely spooled job #1 later.
+  uint32_t jobId(int clientId) const;
   bool hasData();                            // oldest complete job ready to print
   int  readByte();                           // -1 = EOF
   size_t currentJobSize() const { return curSize; }
