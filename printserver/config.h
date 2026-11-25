@@ -19,7 +19,10 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.2.2"     // 2.2.2: IPP review round (panel alive during
+#define FIRMWARE_VERSION "2.2.3"     // 2.2.3: panel flash row renamed to
+                                    //      "Занято во флэше (spool)" - it shows
+                                    //      whole-partition usage, not queue payload;
+                                    // 2.2.2: IPP review round (panel alive during
                                     //      IPP transfers, real job-id/job-uri);
                                     // 2.2.1: version shown on the web panel;
                                     // 2.2.0: web OTA update + endpoint column layout

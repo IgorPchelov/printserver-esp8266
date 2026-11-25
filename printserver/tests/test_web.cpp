@@ -54,7 +54,9 @@ int main() {
   CHECK(insideRow(st, "RSSI=-52dBm", 2), "status: network info in row 3");
   CHECK(insideRow(st, ">7<", 3), "status: pending jobs count in row 4");
   CHECK(insideRow(st, "123456", 4), "status: printed bytes in row 5");
-  CHECK(insideRow(st, "789 Б", 5), "status: spool bytes in row 6");
+  CHECK(insideRow(st, "789 Б", 5), "status: flash usage value in row 6");
+  CHECK(insideRow(st, "Занято во флэше", 5),
+        "status: row 6 labeled 'Занято во флэше (spool)'");
   CHECK(st.indexOf("9.9.9") < st.indexOf("готов"), "status: version row above state row");
   CHECK(indexStatusTable("готов", "net", 0, 0, 0, FIRMWARE_VERSION)
           .indexOf(FIRMWARE_VERSION) > 0,

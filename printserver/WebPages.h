@@ -27,7 +27,10 @@ inline String indexStatusTable(const char* status, const String& netInfo,
        + "</td></tr><tr><th>Сеть</th><td>" + netInfo
        + "</td></tr><tr><th>Заданий в очереди</th><td>" + String(pending)
        + "</td></tr><tr><th>Печатано байт</th><td>" + String(printed)
-       + "</td></tr><tr><th>Очередь на флэше</th><td>" + String(used) + " Б"
+       // NB: 'used' is LittleFS.usedBytes() = whole-partition usage (metadata
+       // + spool, 4 KiB block granularity, ~16 KiB floor even when empty),
+       // so the label says "занято" (usage), not "очередь" (queue payload).
+       + "</td></tr><tr><th>Занято во флэше (spool)</th><td>" + String(used) + " Б"
        + "</td></tr></table>";
 }
 
