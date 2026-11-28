@@ -145,20 +145,25 @@ void StatusDisplay::render() {
     u8g2->drawUTF8(x2, 27, line2.c_str());             // baseline 27 keeps 12px glyphs inside 32px
   }
 
-  // --- activity icon (top-right): classic spinner /-\| ------------------
-  // 2.4.2: the old bar-flicker drew random-length vertical bars that read
-  // as noise ("странная анимация" - user report). A rotating stick is the
-  // universal "busy" glyph: 4 frames, 45 degrees apart, drawn as a short
-  // diagonal line in a 6x6 cell at x=122.
+  // --- activity icon (top-right): a 10x10 "printer working" badge (2.4.4) --
+  // The 2.4.3 6x6 two-pixel stick was unreadable on the display ("что-то
+  // мелькает, не разглядеть" - field report). New glyph: the universal
+  // "printer" pictogram (body + paper sheet) with the sheet ANIMATING -
+  // the paper grows out of the printer on frame 1..3, one row at a time.
+  // 4 frames make a visible loop at OLED_UPDATE_MS cadence; the drawing
+  // is plain drawLine/drawBox, no font needed, fits the 128x64 corner.
   if (busyAnim) {
-    static const uint8_t f1[] = {2,1}, f2[] = {3,2}, f3[] = {2,3}, f4[] = {1,2};
-    const uint8_t* segs[4] = {f1, f2, f3, f4};
-    const uint8_t* s = segs[animFrame & 3];
-    for (uint8_t i = 0; i < 2; i++)
-      u8g2->drawPixel(122 + s[0] + i, 2 + s[1]);
-    // center dot as the pivot: makes the rotation readable at 6 px
-    u8g2->drawPixel(124, 4);
-    u8g2->drawPixel(123, 3);
+    // printer body: 10x5 box, top-left at (117, 1)
+    u8g2->drawFrame(117, 1, 10, 5);
+    // output slot: a 6-wide lip under the body
+    u8g2->drawHLine(119, 6, 6);
+    // paper sheet: grows downward frame by frame (rows 7..9 = 3 steps)
+    // frame & 3: 0 -> empty (printer still chewing), 1..3 -> 1..3 rows
+    uint8_t rows = (animFrame >> 2) & 3;      // slow: 4 ticks per frame
+    if (rows) {
+      u8g2->drawFrame(120, 7, 5, rows + 1);   // sheet outline, growing
+      u8g2->drawHLine(121, 7 + rows, 3);      // last line "ink" on the page
+    }
   }
 
   u8g2->sendBuffer();

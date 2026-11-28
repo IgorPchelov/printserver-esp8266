@@ -95,6 +95,9 @@ public:
   uint16_t getUTF8Width(const char*) { return 0; }
   void drawUTF8(int, int, const char*) {}
   void drawVLine(int, int, int) {}
+  void drawHLine(int, int, int) {}
+  void drawFrame(int, int, int, int) {}
+  void drawBox(int, int, int, int) {}
   void drawPixel(int, int) {}
 };
 typedef U8G2 U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C;

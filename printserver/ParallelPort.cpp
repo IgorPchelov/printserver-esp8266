@@ -173,7 +173,10 @@ bool ParallelPort::writeByte(uint8_t b, uint32_t timeoutMs) {
     if (digitalRead(PIN_LPT_ACK) == LOW) ackFlag = true;   // ACK is a low pulse; sample-level detect
     if (sawBusy && !busy) break;                            // BUSY rose and fell: accepted
     if (!sawBusy && digitalRead(PIN_LPT_ACK) == LOW) break; // very fast printer: ACK already
-    if (millis() - tAccept > 10) break;                     // printers pulse BUSY per byte; 10 ms is plenty
+    if (millis() - tAccept > T_ACCEPT_MS) break;             // printers pulse BUSY per byte
+    // idle-line short-circuit (see writeByteBudget): a sink that latched
+    // neither BUSY nor ACK will never accept - do not burn the window
+    if (millis() - tAccept > 1 && !sawBusy && !ackFlag) break;
     if (millis() - start > timeoutMs) return false;
   }
   return true;
@@ -208,17 +211,29 @@ ParallelPort::WriteResult ParallelPort::writeByteBudget(uint8_t b, uint32_t budg
   digitalWrite(PIN_LPT_STROBE, LOW);
   delayMicroseconds(T_STROBE_LOW_US);
   digitalWrite(PIN_LPT_STROBE, HIGH);
-  // BUSY rose-and-fell / ACK seen / 10 ms - same acceptance wait as
-  // writeByte; a printer that never latches BUSY still completes here.
+  // BUSY rose-and-fell / ACK seen / timeout - same acceptance wait as
+  // writeByte. The timeout is ACCEPTANCE-granular: on a real printer BUSY
+  // rises within ~0.5 us of STROBE and falls when the byte is stored, so
+  // the wait ends on the falling edge long before the cap. On a sink that
+  // NEVER latches BUSY nor pulses ACK (a plain emulator, some Arduinos),
+  // the old 10 ms cap burned the FULL 10 ms on EVERY byte - a 174 KB page
+  // took half an hour and the user rebooted the box (2.4.4 field report).
+  // New behaviour: wait up to T_ACCEPT_MS for a real handshake; if the
+  // port showed NO activity at all (no BUSY edge, no ACK), it is such a
+  // sink - accept the byte immediately instead of parking 10 ms per byte.
+  // A port that DID handshake once keeps the full window for later bytes.
   uint32_t tAccept = millis();
   bool sawBusy = false;
   while (true) {
     bool busy = digitalRead(PIN_LPT_BUSY) == HIGH;
     if (busy) sawBusy = true;
     if (digitalRead(PIN_LPT_ACK) == LOW) ackFlag = true;
-    if (sawBusy && !busy) break;
-    if (!sawBusy && digitalRead(PIN_LPT_ACK) == LOW) break;
-    if (millis() - tAccept > 10) break;
+    if (sawBusy && !busy) break;                            // BUSY rose and fell: accepted
+    if (!sawBusy && digitalRead(PIN_LPT_ACK) == LOW) break; // very fast printer: ACK already
+    if (millis() - tAccept > T_ACCEPT_MS) break;
+    // interface never reacted so far: an idle-line sink will never accept;
+    // do not burn the acceptance window on it every byte
+    if (millis() - tAccept > 1 && !sawBusy && !ackFlag) break;
   }
   return WriteResult::OK;
 }

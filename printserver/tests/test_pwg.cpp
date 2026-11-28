@@ -691,6 +691,59 @@ int main() {
           "held pipeline: same rows/pages as the unheld run");
   }
 
+  // ---------- engine-cycle regression (2.4.4): EOF -> end() -> DRAIN ------
+  // Field bug: the firmware only pumped INSIDE while(hasData()); at input
+  // EOF nobody pumped the epilogue out, the job never completed and hung
+  // "printing" forever (q=1, web alive, no drop line). The engine's new
+  // discipline: on EOF call end(), then pump OUTSIDE the feeding loop until
+  // needsPump() clears; only then is the job complete. This test replays
+  // that exact sequence and asserts the completion signals.
+  {
+    outBytes.clear();
+    const uint32_t W = 16, H = 4;
+    std::vector<uint8_t> d14;
+    d14.push_back('R'); d14.push_back('a'); d14.push_back('S'); d14.push_back('2');
+    std::vector<uint8_t> h14(PWG_HDR_SIZE, 0);
+    auto p14 = [&](uint16_t off, uint32_t val) {
+      h14[off] = val >> 24; h14[off+1] = val >> 16; h14[off+2] = val >> 8; h14[off+3] = val;
+    };
+    p14(PWG_OFF_HWRES_X, 300); p14(PWG_OFF_HWRES_Y, 300);
+    p14(PWG_OFF_WIDTH, W); p14(PWG_OFF_HEIGHT, H);
+    p14(PWG_OFF_BPP, 8); p14(PWG_OFF_BYTESLINE, W);
+    p14(PWG_OFF_COLORSPACE, 18);
+    memcpy(&h14[0], "PwgRaster", 9);
+    d14.insert(d14.end(), h14.begin(), h14.end());
+    for (uint32_t r = 0; r < H; r++) {
+      d14.push_back(0);
+      d14.push_back(15); d14.push_back(0x00);   // repeat 16 black px
+    }
+    PwgToPcl c14;
+    c14.begin(fakeLpt, nullptr);
+    // engine byte loop: feed until EOF, NO pumping inside after EOF
+    for (uint8_t b : d14) {
+      PwgToPcl::Feed f = c14.feed(b);
+      CHECK(f != PwgToPcl::Feed::FAIL, "engine cycle: no decode failure");
+    }
+    // EOF reached: end() queues the epilogue; the ring may still hold rows
+    c14.end();
+    CHECK(c14.needsPump(), "engine cycle: after end() the epilogue still needs draining");
+    // drain stage OUTSIDE the feed loop - the exact 2.4.4 engine path
+    int pumps = 0;
+    for (;;) {
+      PwgToPcl::Feed pf = c14.pump(1000);
+      pumps++;
+      if (pf == PwgToPcl::Feed::OK) break;
+      CHECK(pf != PwgToPcl::Feed::FAIL, "engine cycle: drain never fails on a live sink");
+      if (pumps > 100) { CHECK(false, "engine cycle: drain does not converge"); break; }
+    }
+    CHECK(!c14.needsPump(), "engine cycle: drained fully after end()");
+    CHECK(c14.pagesPrinted() == 1, "engine cycle: page completed after drain");
+    std::string s14(outBytes.begin(), outBytes.end());
+    CHECK(s14.find("\x0c") != std::string::npos,
+          "engine cycle: form feed LEFT the ring (the hung-job bug)");
+    CHECK(s14.find("\x1b*rB") != std::string::npos, "engine cycle: raster end sent");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }

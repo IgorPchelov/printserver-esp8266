@@ -19,7 +19,33 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.4.3"     // 2.4.3: the PWG path (EVERY Android
+#define FIRMWARE_VERSION "2.4.4"     // 2.4.4: field report follow-up -
+                                    //      PWG jobs never COMPLETED: the
+                                    //      drain pump only ran inside
+                                    //      while(hasData()) and at input-EOF
+                                    //      nobody pumped the epilogue (form
+                                    //      feed) out; job hung "printing"
+                                    //      forever (q=1). Drain now runs
+                                    //      after the byte loop; page
+                                    //      completion + [pwg] job complete
+                                    //      line when the ring empties. Byte
+                                    //      acceptance: a port that latches
+                                    //      neither BUSY nor ACK (emulator)
+                                    //      is accepted after 1 ms instead of
+                                    //      burning 10 ms per byte (the page
+                                    //      crawled; user rebooted). mDNS TXT
+                                    //      for Android discovery: adminurl/
+                                    //      pdl_datastream/ty/product/usb_MFG
+                                    //      added - the validator used to
+                                    //      drop the entry moments after it
+                                    //      flashed in the picker. Web: big
+                                    //      state badge + 3 s self-refresh
+                                    //      while printing; OLED: readable
+                                    //      10x10 printer icon with growing
+                                    //      page (the 6x6 flicker was
+                                    //      unreadable); [dbg] progress every
+                                    //      2 s during printing.
+                                    // 2.4.3: the PWG path (EVERY Android
                                     //      job) still froze the box: the
                                     //      decoder wrote to LPT blocking
                                     //      (120 s budget/byte). PwgToPcl now
@@ -181,6 +207,14 @@
                                     // a hung interface gets ONE reset pulse
                                     // per 10 s max - never a reset storm on a
                                     // real printer mid-page
+#define T_ACCEPT_MS            10UL // acceptance window per byte (the IEEE
+                                    // 1284 handshake cap in writeByte /
+                                    // writeByteBudget; see the idle-line
+                                    // short-circuit there - 2.4.4)
+#define PWG_PUMP_BUDGET_MS    120UL // one pump() pass drains the PWG output
+                                    // ring for at most this long before
+                                    // returning to loop() (2.4.4): panel
+                                    // serviced between slices, port fed
 
 // ---------------------------------------------------------------- Network
 #define HTTP_PORT         80

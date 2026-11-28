@@ -227,11 +227,9 @@ PwgToPcl::Sink pwgOut(void*, uint8_t b) {
 void engineSwitchJob() {
   if (pwgActive) {                 // finish the converted job: raster end +
     pwg.end();                     // form feed flush the last partial page.
-                                   // end() only QUEUES the epilogue (2.4.3);
-                                   // the pending output still drains through
-                                   // pump() before this job is truly done -
-                                   // the byte loop keeps pwgActive true and
-                                   // pumps until needsPump() clears.
+                                   // end() only QUEUES the epilogue; the
+                                   // drain stage after the byte loop pumps
+                                   // it out before the job completes.
     pwgActive = false;
   }
   engineJobId = queue.currentJobId();
@@ -288,16 +286,7 @@ void processQueue() {
       if (queue.currentJobId() != engineJobId) {
         // hasData() just advanced the reader to the NEXT queued job (the old
         // one is exhausted). Switch converters AT the boundary so the new
-        // job gets its own decoder/raw path - see engineSwitchJob(). The
-        // switch itself must WAIT until the old job's deferred output has
-        // fully drained (pump() to completion): switching early drops the
-        // pending epilogue/form-feed of the last page (2.4.3).
-        if (pwgActive && pwg.needsPump()) {
-          PwgToPcl::Feed pf = pwg.pump(LPT_BYTE_BUDGET_MS);
-          if (pf == PwgToPcl::Feed::HELD) return;     // port busy: later pass
-          if (pf == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
-          continue;                                    // drained: switch now
-        }
+        // job gets its own decoder/raw path - see engineSwitchJob().
         engineSwitchJob();
       }
       // ---- PWG path: decode input / pump output, both bounded (2.4.3) ----
@@ -307,13 +296,25 @@ void processQueue() {
       // mDNS, OLED and LED stay serviced while the printer chews.
       if (pwgActive) {
         if (pwg.needsPump()) {
-          PwgToPcl::Feed pf = pwg.pump(LPT_BYTE_BUDGET_MS);
+          PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
           if (pf == PwgToPcl::Feed::HELD) return;       // port busy: later pass
           if (pf == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
           continue;                                      // ring drained: feed more
         }
         int b = queue.readByte();
-        if (b < 0) break;                                // input exhausted
+        if (b < 0) {
+          // input EOF: close the decoder (queues the epilogue) and drop to
+          // the drain loop BELOW the while - hasData() just closed the file
+          // so the loop would exit anyway, but the decoder still owes the
+          // port the whole remaining ring + form feed. 2.4.3 bug: the
+          // completion check used to run only when pump() needed nothing,
+          // yet the ONLY pump call site lived INSIDE while(hasData()) - on
+          // EOF nobody pumped ever again, the epilogue never left the ring
+          // and the job hung in "printing" forever (field report: q=1
+          // for 20+ minutes, web alive, no [pwg] drop line).
+          pwg.end();
+          break;
+        }
         PwgToPcl::Feed f = pwg.feed((uint8_t)b);
         if (f == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
         // OK / HELD: the byte was consumed either way; HELD pauses INPUT
@@ -354,14 +355,31 @@ void processQueue() {
       n++;
     }
     if (engState != EngineState::PRINTING) return;   // dropped mid-job above
-    // PWG job completes only when BOTH the input is exhausted AND the
-    // output ring is fully drained (pump() ran to completion after the
-    // last end()). hasData() advanced the queue at input-EOF, so the
-    // completion check below sees the NEXT job; the draining condition
-    // guards the boundary.
-    if (pwgActive && pwg.needsPump()) return;        // ring still draining
+    // ---- PWG drain stage (2.4.4): runs even when the INPUT is exhausted ----
+    // The byte loop above exits at EOF with the decoder still owing the
+    // port its ring + the queued epilogue (form feed). pump() here - OUTSIDE
+    // while(hasData()), which already closed the file at EOF - drains it.
+    // 2.4.3 bug: the only pump() call lived inside the while(hasData())
+    // loop, so at EOF nobody ever pumped again; the epilogue never left
+    // the ring, the job never completed and the queue hung in "printing"
+    // forever (field report: q=1 for 20+ min, web alive, no [pwg] drop).
+    if (pwgActive) {
+      PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
+      if (pf == PwgToPcl::Feed::FAIL) {
+        pwgFailed = true;              // sink died mid-epilogue
+        return;                        // pwgFailed branch handles the drop
+      }
+      if (pf == PwgToPcl::Feed::HELD) return;   // port busy: later pass
+      if (pwg.needsPump()) return;               // more ring: keep pumping
+      // ring drained AND no pending emission: the PWG job is complete
+      queue.markJobState(engineJobId, 9);       // completed
+      pwgActive = false;
+      Serial.println("[pwg] job complete (epilogue drained)");
+      engState = EngineState::IDLE;
+      display.setState(uiFor(engState));
+      return;
+    }
     if (!queue.hasData() && !pwgFailed) {
-      if (pwgActive) { pwg.end(); pwgActive = false; }
       queue.markJobState(engineJobId, 9);   // completed: last job printed
       engState = EngineState::IDLE;
       display.setState(uiFor(engState));
@@ -419,13 +437,37 @@ void handleHttp(WiFiClient c) {
   }
 
   if (method == "GET" && (path == "/" || path == "/index.html")) {
+    bool printing = (engState == EngineState::PRINTING || engState == EngineState::RECEIVING);
     String body = String("<!DOCTYPE html><html><head><meta charset=utf-8>"
       "<meta name=viewport content='width=device-width,initial-scale=1'>"
       "<title>") + PRINTER_NAME + " " + FIRMWARE_VERSION + "</title>"
       "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto;padding:0 1em}"
       "h1{font-size:1.4em}h2{font-size:1.1em}table{border-collapse:collapse;width:100%;margin:.4em 0 1em}"
-      "td,th{border:1px solid #ccc;padding:.4em}</style></head><body>"
+      "td,th{border:1px solid #ccc;padding:.4em}"
+      // print badge (2.4.4): a BIG, unmistakable indicator instead of the
+      // tiny corner flicker the user could not read. Big colored block with
+      // the state word + live byte counter; pulsing border while printing.
+      "#badge{display:block;border-radius:8px;padding:.6em 1em;margin:.6em 0 1em;"
+      "font-size:1.15em;font-weight:bold;text-align:center}"
+      ".b-print{background:#ffd;color:#660;border:3px solid #d80;animation:bp 1.2s infinite}"
+      ".b-ready{background:#efe;color:#060;border:3px solid #0a0}"
+      ".b-off{background:#fee;color:#900;border:3px solid #c00}"
+      "@keyframes bp{50%{border-color:#fb0}}</style></head><body>"
       "<h1>" PRINTER_NAME "</h1>";
+    // badge first: state is the thing the user checks most
+    {
+      const char* cls = printing ? "b-print"
+                      : (lpt.status() == LptStatus::OFFLINE || lpt.status() == LptStatus::UNKNOWN)
+                          ? "b-off" : "b-ready";
+      const char* txt = engState == EngineState::PRINTING ? "ПЕЧАТЬ ИДЁТ"
+                      : engState == EngineState::RECEIVING ? "ПРИЁМ ДАННЫХ"
+                      : (lpt.status() == LptStatus::OFFLINE || lpt.status() == LptStatus::UNKNOWN)
+                          ? "ПРИНТЕР НЕ ПОДКЛЮЧЁН" : "ГОТОВ";
+      char buf[96];
+      snprintf(buf, sizeof(buf), "<span id=badge class='%s'>%s &middot; %lu байт</span>", cls, txt,
+               (unsigned long)printBytes);
+      body += buf;
+    }
     // status table with the firmware version as its first row (the user
     // needs to see which build the box runs - especially with OTA updates)
     // - see WebPages.h
@@ -437,6 +479,13 @@ void handleHttp(WiFiClient c) {
     body += printEndpointsTable(net.ip());
     body += "<p><a href='/wifi'>Настройка WiFi</a> &middot; "
             "<a href='/update'>Обновление прошивки</a></p>"
+            // live progress (2.4.4): the user REFRESHED the page manually to
+            // watch "Печатано байт" grow. While printing (or spooling) the
+            // page now reloads itself every 3 s; a settled box does not
+            // re-render at all (the LED/mDNS/OLED keep the panel cheap).
+            // A fixed-badge printout also updates without a manual reload.
+            "<script>if(" + String(printing ? 1 : 0) + ")"
+            "setTimeout(function(){location.reload()},3000);</script>"
             "</body></html>";
     httpSend(c, "text/html; charset=utf-8", body);
   } else if (method == "GET" && path == "/wifi") {
@@ -1100,10 +1149,33 @@ void setup() {
   if (MDNS.begin(NetService::hostName().c_str())) {
     MDNS.addService("ipp", "tcp", IPP_PORT);
     mdns_service_instance_name_set("_ipp", "_tcp", PRINTER_NAME);
+    // TXT records tuned for Android's printer validator (2.4.4): the
+    // discovery flow (PrinterRegistry / LocalPrinterDiscovery in the
+    // Android print service) resolves the service and then probes the
+    // IPP endpoint; an entry missing the TXT keys it looks for is marked
+    // unusable and DISAPPEARS from the "nearby printers" list moments
+    // after first showing (field report: "мелькает и исчезает"). The
+    // keys below are the set Android actually reads from an _ipp._tcp
+    // advertisement (AIRPRINT-ish printer):
+    //   rp / note / UUID       - identification (were already present)
+    //   adminurl               - a reachable web panel URL (validator checks
+    //                            resolvability of the admin interface)
+    //   pdl_datastream         - the RAW JetDirect port: lets Android fall
+    //                            back to a plain 9100 stream for clients
+    //                            without IPP transport
+    //   ty / product / usb_MFG - vendor strings shown in the picker and used
+    //                            to tell "real hardware" from random _ipp
+    //                            services (a service without ty is often
+    //                            treated as a non-printer by the validator)
     MDNS.addServiceTxt("ipp", "tcp", "rp", "lp");
     MDNS.addServiceTxt("ipp", "tcp", "note", PRINTER_NAME);
     MDNS.addServiceTxt("ipp", "tcp", "UUID",
       String("964") + String((uint32_t)ESP.getEfuseMac(), HEX) + "-esp32s3");
+    MDNS.addServiceTxt("ipp", "tcp", "adminurl", "http://" + net.ip() + "/");
+    MDNS.addServiceTxt("ipp", "tcp", "pdl_datastream", "application/vnd.hp-pcl");
+    MDNS.addServiceTxt("ipp", "tcp", "ty", PRINTER_NAME);
+    MDNS.addServiceTxt("ipp", "tcp", "product", "esp32s3-lpt");
+    MDNS.addServiceTxt("ipp", "tcp", "usb_MFG", "ESP");
     MDNS.addService("pdl-datastream", "tcp", RAW_PORT);
     mdns_service_instance_name_set("_pdl-datastream", "_tcp", PRINTER_NAME_SOCKET);
     MDNS.addService("http", "tcp", HTTP_PORT);
@@ -1244,11 +1316,25 @@ void loop() {
 
   // status LED heartbeat + debug
   static uint32_t lastDbg = 0;
-  if (millis() - lastDbg > 10000) {
-    lastDbg = millis();
-    Serial.printf("[dbg] %s | lpt=%s | q=%d | heap=%u\n",
-      net.info().c_str(), lptStatusName(lpt.status()), queue.pendingCount(),
-      (unsigned)ESP.getFreeHeap());
+  static uint32_t lastDbgPrint = 0;
+  if (engState == EngineState::PRINTING) {
+    // progress line while printing (2.4.4): the 10 s [dbg] cadence is far
+    // too slow to see a print move; a 2 s cadence with the byte counter
+    // answers "is it printing or hung?" at a glance
+    if (millis() - lastDbgPrint > 2000) {
+      lastDbgPrint = millis();
+      Serial.printf("[dbg] печать: байт=%lu | q=%d | heap=%u\n",
+                    (unsigned long)printBytes, queue.pendingCount(),
+                    (unsigned)ESP.getFreeHeap());
+    }
+  } else {
+    lastDbgPrint = millis();               // reset so a new print logs at once
+    if (millis() - lastDbg > 10000) {
+      lastDbg = millis();
+      Serial.printf("[dbg] %s | lpt=%s | q=%d | heap=%u\n",
+                    net.info().c_str(), lptStatusName(lpt.status()), queue.pendingCount(),
+                    (unsigned)ESP.getFreeHeap());
+    }
   }
   delay(1);
 }
