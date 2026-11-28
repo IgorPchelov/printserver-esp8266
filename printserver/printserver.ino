@@ -503,6 +503,11 @@ void handleIpp(WiFiClient c) {
   bool chunked = false;
   bool expect100 = false;
   String reqLine = c.readStringUntil('\r'); c.readStringUntil('\n');
+  // Minimal request line the client actually sent - Android adds a printer
+  // by bare IP and probes ports; when a job never arrives ("q=0" in the
+  // [dbg] line, no [ipp] log at all) the probe/POST line tells whether the
+  // phone reached the box at all and which path it hit.
+  Serial.println(String("[ipp] ") + reqLine.substring(0, 60));
   // Line-capped like handleHttp: see the comment there.
   for (int lines = 0; c.connected() && lines < 40; lines++) {
     String h = c.readStringUntil('\r'); c.readStringUntil('\n');
@@ -727,10 +732,11 @@ void handleIpp(WiFiClient c) {
       queue.markFormat(slot, isPwg);
       uint8_t buf[1024];
       uint32_t idle = 0;
+      uint32_t spoolBytes = 0;         // bytes actually stored (for the log line)
       long remaining = contentLength;   // -1 if chunked
       size_t chunkLeft = 0;
       bool chunkHeaderPending = true;   // need to read a chunk-size line first
-      bool sawTerminal = false;         // chunked: the 0-size terminal chunk arrived
+      bool sawTerminal = false;        // chunked: the 0-size terminal chunk arrived
       while (c.connected() && idle < 10000) {
         int av = c.available();
         if (av <= 0) { idle += 10; panelPump(); continue; }   // see header comment
@@ -745,7 +751,7 @@ void handleIpp(WiFiClient c) {
             continue;
           }
           int n = c.read(buf, min((size_t)av, min(chunkLeft, sizeof(buf))));
-          chunkLeft -= n; remaining -= n;
+          chunkLeft -= n; remaining -= n; spoolBytes += n;
           queue.write(slot, buf, n);
           if (chunkLeft == 0) {                    // consume trailing CRLF
             // (bugfix) this wait never incremented its own timeout counter
@@ -761,7 +767,7 @@ void handleIpp(WiFiClient c) {
         } else {
           if (remaining == 0) break;
           int n = c.read(buf, min((size_t)av, min((size_t)remaining, sizeof(buf))));
-          remaining -= n;
+          remaining -= n; spoolBytes += n;
           queue.write(slot, buf, n);
         }
       }
@@ -772,8 +778,12 @@ void handleIpp(WiFiClient c) {
       // (endJob discarding a failed write) stays server-error-device-error.
       if (chunked && !sawTerminal) truncated = true;      // no terminal 0-chunk seen
       if (!chunked && remaining > 0) truncated = true;    // promised bytes missing
+      uint32_t jid = queue.jobId(slot);    // 0 after endJob - capture first
       stored = queue.endJob(slot, truncated);
       rawActive[slot] = false;
+      Serial.printf("[ipp] Print-Job %s: %u B (job %u)%s\n",
+                    stored ? "stored" : "DENIED", (unsigned)spoolBytes, jid,
+                    truncated ? " - truncated transfer" : "");
       // IDLE only from RECEIVING - see the slot-taking comment above: never
       // clobber PRINTING, or the running job's decoder restarts mid-file.
       if (engState == EngineState::RECEIVING) {
@@ -821,7 +831,10 @@ void setup() {
 
   LittleFS.begin(true);
   lpt.begin();
-  queue.begin();
+  queue.begin();   // reboot policy: wipes any queued jobs (see PrintQueue)
+  if (queue.purgedAtBoot() > 0)
+    Serial.printf("[q] reboot policy: purged %d queued job(s) from flash\n",
+                  queue.purgedAtBoot());
   net.begin();                           // non-blocking join with stored credentials
   net.waitConnected(panelPump);
   display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
@@ -876,8 +889,10 @@ void loop() {
     int slot = -1;
     for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
     if (slot < 0 || !queue.canStore() || !queue.startJob(slot)) {
+      Serial.println("[raw] connect refused: no slot or flash full");
       nc.stop();      // all slots busy or flash full: refuse the connection
     } else {
+      Serial.println("[raw] connect accepted (JetDirect 9100)");
       rawClients[slot] = nc; rawActive[slot] = true;
       rawLastByte[slot] = millis();
       // RECEIVING only from IDLE. Overwriting PRINTING here would pause the

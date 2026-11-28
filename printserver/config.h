@@ -19,7 +19,12 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.2.3"     // 2.2.3: panel flash row renamed to
+#define FIRMWARE_VERSION "2.3.0"     // 2.3.0: reboot policy - begin() purges the
+                                    //      whole queue (no stale jobs after power-up),
+                                    //      [ipp]/[raw]/[q] serial logs for connections
+                                    //      and verdicts (a job that never arrived is
+                                    //      now visible in the monitor);
+                                    // 2.2.3: panel flash row renamed to
                                     //      "Занято во флэше (spool)" - it shows
                                     //      whole-partition usage, not queue payload;
                                     // 2.2.2: IPP review round (panel alive during

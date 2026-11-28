@@ -11,9 +11,43 @@ String PrintQueue::jobPath(uint32_t id, bool finalized) const {
 }
 
 void PrintQueue::begin() {
+  // Reboot policy (user request): every power-up starts with an EMPTY queue.
+  // A print server is not an archive - a year-old spooled file flushed to a
+  // newly attached printer would print mystery garbage. In-flight jobs died
+  // with the power cut anyway (only .tmp files could hold a half-transfer,
+  // and those are junk by definition), and the IPP/raw handlers only queue
+  // while the network is up - a reboot clears exactly the stale leftovers.
+  // This replaces the old "survive reboot with ids" contract (its
+  // .okw-id fix is kept for nextId bookkeeping: ids still never wrap onto
+  // leftover filenames); host test group 3 pins the new contract.
+  purgeAll();
   LittleFS.mkdir("/q");
-  cleanupStale();
   rescan();
+}
+
+void PrintQueue::purgeAll() {
+  purgedBoot = 0;
+  File dir = LittleFS.open(QUEUE_FILES_PREFIX);
+  if (!dir || !dir.isDirectory()) return;
+  File f;
+  while ((f = dir.openNextFile())) {
+    String n = f.name();
+    f.close();
+    if (!n.startsWith("/") ) n = String(QUEUE_FILES_PREFIX) + n;
+    bool pwg = n.endsWith(".okw");
+    if (n.endsWith(".tmp") || n.endsWith(".ok") || pwg) {
+      // ids still advance past purged files so a fresh spool can never
+      // reuse a name that a cached/stale reference (IPP job-uri quoted to
+      // a client before the reboot) might still point at.
+      // Suffix cut: ".okw"/".tmp" are 4 chars, ".ok" is 3.
+      uint32_t id = (uint32_t) n.substring(n.lastIndexOf('/') + 1,
+                                           n.length() - (pwg || n.endsWith(".tmp") ? 4 : 3)).toInt();
+      if (id >= nextId) nextId = id + 1;
+      LittleFS.remove(n);
+      purgedBoot++;
+    }
+  }
+  dir.close();
 }
 
 void PrintQueue::cleanupStale() {

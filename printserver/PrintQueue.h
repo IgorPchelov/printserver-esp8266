@@ -46,6 +46,9 @@ public:
   void dropCurrent();                         // delete job being read (error path)
   size_t usedBytes() const;
   int pendingCount() const { return pending; }
+  // How many queued jobs (both flavours) the last begin() removed from /q
+  // (user-requested reboot policy). Diagnostic: 0 is not worth a log line.
+  int purgedAtBoot() const { return purgedBoot; }
 private:
   File writers[MAX_CONCURRENT_JOBS];
   uint32_t writerIds[MAX_CONCURRENT_JOBS] = {0};
@@ -60,7 +63,9 @@ private:
   uint32_t nextId = 1;
   uint32_t doneCount = 0;
   int pending = 0;
+  int purgedBoot = 0;        // jobs begin() removed this boot (see purgedAtBoot())
   void rescan();            // rebuild pending count from directory listing
   void cleanupStale();      // remove orphaned non-finalized files
+  void purgeAll();          // reboot policy: drop every job from /q
   String jobPath(uint32_t id, bool finalized) const;
 };

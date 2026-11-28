@@ -94,31 +94,45 @@ int main() {
     CHECK(!q.hasData(), "both jobs drained");
   }
 
-  // ---------- group 3: .okw ids survive a "reboot" (round-3 regression) --
-  // A queue holding ONLY PWG jobs used to reset nextId to 1 at begin();
-  // the next spooled job then OVERWROTE /q/1.okw. Now every .ok and .okw id
-  // feeds nextId, and spooling after "reboot" continues past the old max.
+  // ---------- group 3: reboot policy - begin() purges the whole queue ------
+  // User-requested contract: every boot starts with an EMPTY queue (a
+  // year-old spooled file must not flush to a newly attached printer).
+  // Purged ids still advance nextId so a fresh spool never reuses a name
+  // a stale client reference (IPP job-uri quoted before the reboot) could
+  // point at. Replaces the old "survive reboot with ids" group.
   lfsGlueFormat();
   {
     PrintQueue q1;
     q1.begin();
-    spool(q1, 0, "one", true);
-    spool(q1, 1, "two", true);
-    spool(q1, 2, "three", true);
+    spool(q1, 0, "one", true);    // .okw (Android PWG flavour)
+    spool(q1, 1, "two", false);   // .ok  (raw flavour)
+    {   // plus a stray .tmp as a power-loss leftover
+      File f = LittleFS.open("/q/9.tmp", "w");
+      CHECK((bool)f, "stray .tmp created");
+      f.write((const uint8_t*)"garbage", 7);
+      f.close();
+    }
+    CHECK(q1.pendingCount() == 2, "two jobs queued before reboot");
     // "reboot": a fresh queue instance over the same (mounted) FS
     PrintQueue q2;
     q2.begin();
+    CHECK(!q2.hasData(), "after reboot: queue is empty (policy)");
+    CHECK(q2.pendingCount() == 0, "after reboot: pending is 0");
+    CHECK(q2.purgedAtBoot() == 3, "purgedAtBoot counts .ok + .okw + .tmp");
+    CHECK(!LittleFS.open("/q/1.okw"), "purged .okw file gone");
+    CHECK(!LittleFS.open("/q/2.ok"), "purged .ok file gone");
+    CHECK(!LittleFS.open("/q/9.tmp"), "stray .tmp also purged");
+    // nextId must still run past the purged max (stray .tmp id 9 counts
+    // too): job ids never wrap onto old filenames (stale job-uri safety),
+    // content is fresh
     spool(q2, 0, "four", true);
-    // read all four jobs in id order; all four must exist with content intact
-    CHECK(q2.hasData() && q2.currentJobId() == 1, "after reboot: oldest .okw still there");
-    CHECK(readJob(q2) == "one", "job 1 content intact (not overwritten)");
-    CHECK(q2.hasData() && q2.currentJobId() == 2, "job 2 present");
-    CHECK(readJob(q2) == "two", "job 2 content intact");
-    CHECK(q2.hasData() && q2.currentJobId() == 3, "job 3 present");
-    CHECK(readJob(q2) == "three", "job 3 content intact");
-    CHECK(q2.hasData() && q2.currentJobId() == 4, "new job got id 4 (past the old max)");
-    CHECK(readJob(q2) == "four", "job 4 content intact");
-    CHECK(!q2.hasData(), "all four drained");
+    CHECK(q2.hasData() && q2.currentJobId() == 10, "new job got id 10 (past purged 1,2,9)");
+    CHECK(readJob(q2) == "four", "fresh job content intact");
+    CHECK(!q2.hasData(), "queue drained");
+    // a second "reboot" on an EMPTY queue is a no-op, not an error
+    PrintQueue q3;
+    q3.begin();
+    CHECK(!q3.hasData() && q3.purgedAtBoot() == 0, "reboot on empty queue is a no-op");
   }
 
   // ---------- group 4: stale .tmp cleanup at begin() ----------------------
