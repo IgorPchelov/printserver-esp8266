@@ -282,6 +282,16 @@ void processQueue() {
       return;
     }
     int n = 0;
+    // inputEof gates the drain stage (2.4.5): the byte loop below exits on
+    // a TIME-SLICE boundary (n==512) with the ring EMPTY and thousands of
+    // input bytes still queued. The 2.4.4 drain stage ran after EVERY exit
+    // and "completed" the job whenever the ring happened to be empty - the
+    // file never reached EOF, never got removed, and processQueue re-took
+    // the SAME job on the next pass: [pwg] converting -> complete pair per
+    // few bytes, forever (field log: 9115 pairs, q=1, байт=0). Only a
+    // genuine input EOF (readByte -1) may enter the drain stage now; a
+    // time-slice exit just returns (next pass keeps feeding input).
+    bool inputEof = false;
     while (n < 512 && queue.hasData() && engState == EngineState::PRINTING) {
       if (queue.currentJobId() != engineJobId) {
         // hasData() just advanced the reader to the NEXT queued job (the old
@@ -304,7 +314,7 @@ void processQueue() {
         int b = queue.readByte();
         if (b < 0) {
           // input EOF: close the decoder (queues the epilogue) and drop to
-          // the drain loop BELOW the while - hasData() just closed the file
+          // the drain stage BELOW the while - hasData() just closed the file
           // so the loop would exit anyway, but the decoder still owes the
           // port the whole remaining ring + form feed. 2.4.3 bug: the
           // completion check used to run only when pump() needed nothing,
@@ -313,6 +323,7 @@ void processQueue() {
           // and the job hung in "printing" forever (field report: q=1
           // for 20+ minutes, web alive, no [pwg] drop line).
           pwg.end();
+          inputEof = true;
           break;
         }
         PwgToPcl::Feed f = pwg.feed((uint8_t)b);
@@ -355,7 +366,34 @@ void processQueue() {
       n++;
     }
     if (engState != EngineState::PRINTING) return;   // dropped mid-job above
-    // ---- PWG drain stage (2.4.4): runs even when the INPUT is exhausted ----
+    // EOF fallback (2.4.5, pinned by the host engine-cycle test): the byte
+    // loop can exit WITHOUT readByte()==-1 ever being seen - after the last
+    // byte is consumed, the loop's own hasData() check finds available()==0,
+    // closes the reader and removes the file; the loop then exits on
+    // hasData()==false with inputEof still false. If the decoder is active,
+    // the queue is empty AND nothing is pending, the input IS exhausted -
+    // treat it as EOF (calling hasData() here is safe: with no files left
+    // it only scans an empty directory and returns false).
+    if (pwgActive && !inputEof && !queue.hasData() && !pwg.needsPump())
+      inputEof = true;
+    // ---- PWG path continuation (2.4.5): NOT at EOF - keep feeding ------
+    // The byte loop above exits either at input EOF (inputEof, drain below)
+    // or on a TIME-SLICE boundary (n==512 / a HELD return to loop()). On
+    // the slice boundary the ring may be empty while the file still has
+    // thousands of bytes: the 2.4.4 drain stage ran here anyway and
+    // "completed" the job mid-input - the file was never removed, and the
+    // next pass re-converted the SAME job forever (field log: converting
+    // -> complete pair cycling thousands of times, q=1, печать навсегда).
+    // A slice-exit just drains any backpressure and returns: the next
+    // loop() pass continues feeding input bytes.
+    if (pwgActive && !inputEof) {
+      if (pwg.needsPump()) {
+        PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
+        if (pf == PwgToPcl::Feed::FAIL) pwgFailed = true;
+      }
+      return;                       // mid-input: never complete the job here
+    }
+    // ---- PWG drain stage (2.4.4): runs ONLY when the INPUT is exhausted ----
     // The byte loop above exits at EOF with the decoder still owing the
     // port its ring + the queued epilogue (form feed). pump() here - OUTSIDE
     // while(hasData()), which already closed the file at EOF - drains it.
@@ -363,7 +401,7 @@ void processQueue() {
     // loop, so at EOF nobody ever pumped again; the epilogue never left
     // the ring, the job never completed and the queue hung in "printing"
     // forever (field report: q=1 for 20+ min, web alive, no [pwg] drop).
-    if (pwgActive) {
+    if (pwgActive) {   // inputEof is true here
       PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
       if (pf == PwgToPcl::Feed::FAIL) {
         pwgFailed = true;              // sink died mid-epilogue
@@ -1157,7 +1195,7 @@ void setup() {
     // after first showing (field report: "мелькает и исчезает"). The
     // keys below are the set Android actually reads from an _ipp._tcp
     // advertisement (AIRPRINT-ish printer):
-    //   rp / note / UUID       - identification (were already present)
+    //   rp / UUID              - identification
     //   adminurl               - a reachable web panel URL (validator checks
     //                            resolvability of the admin interface)
     //   pdl_datastream         - the RAW JetDirect port: lets Android fall
@@ -1167,10 +1205,16 @@ void setup() {
     //                            to tell "real hardware" from random _ipp
     //                            services (a service without ty is often
     //                            treated as a non-printer by the validator)
+    // note= was dropped (2.4.5): it duplicated ty with the same value, and
+    // the two vendor-string TXTs confused some resolvers. Every service now
+    // carries its OWN UUID: with the _pdl-datastream entry UUID-less, Android
+    // keyed it onto the same printer as the _ipp entry and hid one of the
+    // two rows, re-showing it whenever the mDNS announce order changed -
+    // the visible "мелькает и исчезает" (2.4.5 field report).
+    String uuid    = String("964") + String((uint32_t)ESP.getEfuseMac(), HEX) + "-esp32s3";
+    String uuidRaw = String("965") + String((uint32_t)ESP.getEfuseMac(), HEX) + "-esp32s3";
     MDNS.addServiceTxt("ipp", "tcp", "rp", "lp");
-    MDNS.addServiceTxt("ipp", "tcp", "note", PRINTER_NAME);
-    MDNS.addServiceTxt("ipp", "tcp", "UUID",
-      String("964") + String((uint32_t)ESP.getEfuseMac(), HEX) + "-esp32s3");
+    MDNS.addServiceTxt("ipp", "tcp", "UUID", uuid);
     MDNS.addServiceTxt("ipp", "tcp", "adminurl", "http://" + net.ip() + "/");
     MDNS.addServiceTxt("ipp", "tcp", "pdl_datastream", "application/vnd.hp-pcl");
     MDNS.addServiceTxt("ipp", "tcp", "ty", PRINTER_NAME);
@@ -1178,6 +1222,10 @@ void setup() {
     MDNS.addServiceTxt("ipp", "tcp", "usb_MFG", "ESP");
     MDNS.addService("pdl-datastream", "tcp", RAW_PORT);
     mdns_service_instance_name_set("_pdl-datastream", "_tcp", PRINTER_NAME_SOCKET);
+    MDNS.addServiceTxt("pdl-datastream", "tcp", "UUID", uuidRaw);
+    MDNS.addServiceTxt("pdl-datastream", "tcp", "ty", PRINTER_NAME_SOCKET);
+    MDNS.addServiceTxt("pdl-datastream", "tcp", "product", "esp32s3-lpt");
+    MDNS.addServiceTxt("pdl-datastream", "tcp", "usb_MFG", "ESP");
     MDNS.addService("http", "tcp", HTTP_PORT);
   }
 
@@ -1198,6 +1246,11 @@ void loop() {
   bool wasAp = net.isAp();
   net.tick();
   lpt.poll();
+  // queued-jobs digit (2.4.5): feed the spool depth to the OLED every
+  // loop pass - "готов" with a digit in the corner now honestly says
+  // "and there are N more jobs waiting". Cheap: an int copy, the digit
+  // only redraws on the OLED_UPDATE_MS cadence.
+  display.setQueuedJobs(queue.pendingCount());
   display.tick();
   pollButton();                           // BOOT hold: force AP (works while joining too)
   syncLed();                              // LED mirrors the OLED state + printer attention

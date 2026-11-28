@@ -19,7 +19,36 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.4.4"     // 2.4.4: field report follow-up -
+#define FIRMWARE_VERSION "2.4.5"     // 2.4.5: the 2.4.4 drain stage
+                                    //      "completed" PWG jobs on a
+                                    //      TIME-SLICE boundary (n==512)
+                                    //      with the ring empty and the
+                                    //      input file thousands of bytes
+                                    //      from EOF - the spool file was
+                                    //      never removed and the engine
+                                    //      re-took the SAME job forever
+                                    //      (field log: converting ->
+                                    //      complete pair cycling 9115x,
+                                    //      q=1, печать навсегда). Drain
+                                    //      now runs ONLY at genuine input
+                                    //      EOF. RAW 9100 idle timeout
+                                    //      30 s (Windows holds the socket
+                                    //      open waiting for the server
+                                    //      to close - JetDirect
+                                    //      semantics; the endless
+                                    //      "Загрузка данных" ends in
+                                    //      half a minute, not five
+                                    //      minutes). OLED: queued-jobs
+                                    //      digit top-right (user
+                                    //      request: "хочется видеть, что
+                                    //      в очереди еще что-то
+                                    //      осталось"). mDNS: per-service
+                                    //      UUIDs + note= dropped (the
+                                    //      UUID-less _pdl-datastream row
+                                    //      merged with the _ipp row in
+                                    //      Android's picker and the
+                                    //      entry flickered out).
+                                    // 2.4.4: field report follow-up -
                                     //      PWG jobs never COMPLETED: the
                                     //      drain pump only ran inside
                                     //      while(hasData()) and at input-EOF
@@ -220,9 +249,18 @@
 #define HTTP_PORT         80
 #define IPP_PORT          631
 #define RAW_PORT          9100   // JetDirect / AppSocket
-#define RAW_IDLE_TIMEOUT_MS 300000UL // raw client silent this long = dead (half-open
-                                     // TCP / crashed sender): drop its spool job and
-                                     // free the slot. Healthy streams never pause 5 min.
+#define RAW_IDLE_TIMEOUT_MS 30000UL // raw client silent this long = done/dead:
+                                     // Windows keeps the 9100 socket OPEN after
+                                     // the last byte (it waits for the SERVER to
+                                     // close first - JetDirect close semantics),
+                                     // so the spooled job finalizes only after
+                                     // this idle gap. 30 s ends the "Загрузка
+                                     // данных" screen in half a minute instead
+                                     // of the 2.4.4 five minutes (field report:
+                                     // "endless upload" for a one-character
+                                     // page, user rebooted the box). A healthy
+                                     // stream never pauses 30 s mid-send; a
+                                     // crashed/half-open sender gets dropped.
 #define LPD_PORT          515    // RFC 1179 Line Printer Daemon
 #define AP_PASSWORD       ""     // open AP by default; set via web panel
 #define WIFI_STA_TIMEOUT_MS 20000UL

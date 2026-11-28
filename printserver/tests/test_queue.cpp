@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include "../PrintQueue.h"
+#include "../PwgToPcl.h"
 #include "../config.h"
 
 static int failures = 0;
@@ -336,6 +337,132 @@ int main() {
     CHECK(x1 == 'X', "pushback: new job reads X");
     q.pushback();
     CHECK(q.readByte() == 'X', "pushback: replay across the boundary stays exact");
+  }
+
+  // ---------- engine-cycle regression (2.4.5): time-slice must NOT complete ----------
+  // The 2.4.4 firmware drain stage declared a PWG job complete whenever the
+  // output ring was empty - including after a TIME-SLICE exit (n==512) with
+  // the input file far from EOF. The spool file was never removed, the engine
+  // re-took the SAME job on the next pass and the "converting -> complete"
+  // pair cycled forever (field log: 9115 cycles, q=1, печать навсегда).
+  // This replays the exact engine loop (byte-for-byte from processQueue())
+  // against the REAL queue + decoder and asserts the 2.4.5 discipline:
+  // completion ONLY at input EOF.
+  {
+    lfsGlueFormat();
+    LittleFS.begin(true);
+    static std::vector<uint8_t> sinkOut;      // PCL bytes the "port" took
+    sinkOut.clear();
+    auto sink = [](void*, uint8_t b) -> PwgToPcl::Sink {
+      sinkOut.push_back(b);
+      return PwgToPcl::Sink::OK;
+    };
+    // build a multi-slice PWG doc: >512 input bytes forces several n==512
+    // slice exits before EOF (each slice is the 2.4.4 trap)
+    std::vector<uint8_t> doc;
+    auto be32 = [&](std::vector<uint8_t>& v, uint32_t x) {
+      v.push_back(x >> 24); v.push_back(x >> 16); v.push_back(x >> 8); v.push_back(x);
+    };
+    be32(doc, 0x52615332);                     // ONE sync at file start
+    for (int page = 0; page < 2; page++) {     // 2 pages: headers alone = 3592 B
+      std::vector<uint8_t> h(PWG_HDR_SIZE, 0);
+      auto p = [&](int off, uint32_t val) {
+        h[off] = val >> 24; h[off+1] = val >> 16; h[off+2] = val >> 8; h[off+3] = val;
+      };
+      p(PWG_OFF_HWRES_X, 300); p(PWG_OFF_HWRES_Y, 300);
+      p(PWG_OFF_WIDTH, 64); p(PWG_OFF_HEIGHT, 4);
+      p(PWG_OFF_BPP, 8); p(PWG_OFF_BYTESLINE, 64);
+      p(PWG_OFF_COLORSPACE, 18);
+      memcpy(&h[0], "PwgRaster", 9);
+      doc.insert(doc.end(), h.begin(), h.end());
+      for (int r = 0; r < 4; r++) {            // rows: repeatByte + ctl + pixel
+        doc.push_back(0); doc.push_back(63); doc.push_back((uint8_t)0);
+      }
+    }
+    PrintQueue q;
+    q.begin();
+    CHECK(q.startJob(0), "engine cycle: writer opens");
+    for (size_t i = 0; i < doc.size(); i++) q.writeByte(0, doc[i]);
+    q.markFormat(0, true);
+    CHECK(q.endJob(0, false), "engine cycle: job finalized");
+    size_t usedWithJob = q.usedBytes();      // fs usage WITH the spool file
+    CHECK(doc.size() > 512 + PWG_HDR_SIZE, "engine cycle: doc forces several slices");
+
+    // ---- the engine loop, byte-for-byte from processQueue() (2.4.5) ----
+    PwgToPcl pwg;
+    bool pwgActive = false, pwgFailed = false, inputEof = false;
+    uint32_t engineJobId = 0;
+    int enginePasses = 0, completes = 0;
+    enum class ES { IDLE, PRINTING } es = ES::IDLE;
+    auto engineSwitch = [&]() {
+      engineJobId = q.currentJobId();
+      if (q.currentJobIsPwg()) { pwg.begin(sink, nullptr); pwgActive = true; }
+    };
+    while (es != ES::IDLE || q.hasData()) {
+      enginePasses++;
+      if (enginePasses > 200) break;            // hard cap: 2.4.4 cycled forever
+      if (es == ES::IDLE && q.hasData()) { es = ES::PRINTING; engineSwitch(); }
+      if (es != ES::PRINTING) break;
+      if (pwgFailed) { q.dropCurrent(); pwgFailed = false; pwgActive = false; es = ES::IDLE; continue; }
+      int n = 0;
+      inputEof = false;
+      while (n < 512 && q.hasData() && es == ES::PRINTING) {
+        if (q.currentJobId() != engineJobId) engineSwitch();
+        if (pwgActive) {
+          if (pwg.needsPump()) {
+            PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
+            if (pf == PwgToPcl::Feed::HELD) break;
+            if (pf == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
+            continue;
+          }
+          int b = q.readByte();
+          if (b < 0) { pwg.end(); inputEof = true; printf("[eof seen via readByte]\n"); break; }
+          PwgToPcl::Feed f = pwg.feed((uint8_t)b);
+          if (f == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
+          if (f == PwgToPcl::Feed::HELD) break;
+          n++;
+          continue;
+        }
+      }
+      if (es != ES::PRINTING) continue;
+      // EOF fallback (mirrors the 2.4.5 firmware fix): hasData() false with
+      // the decoder still active means the reader closed+removed the file
+      // inside the loop's hasData() check - the input IS exhausted.
+      if (pwgActive && !inputEof && !q.hasData() && !pwg.needsPump()) inputEof = true;
+      // ---- 2.4.5 discipline: slice exit just returns; EOF drains ----
+      if (pwgActive && !inputEof) {
+        if (pwg.needsPump()) {
+          PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
+          if (pf == PwgToPcl::Feed::FAIL) pwgFailed = true;
+        }
+        continue;
+      }
+      if (pwgActive && inputEof) {
+        for (;;) {
+          PwgToPcl::Feed pf = pwg.pump(PWG_PUMP_BUDGET_MS);
+          if (pf == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
+          if (pf == PwgToPcl::Feed::HELD) continue;
+          if (pwg.needsPump()) continue;
+          break;
+        }
+        if (!pwgFailed) {
+          completes++;
+          pwgActive = false;
+          es = ES::IDLE;
+          continue;
+        }
+      }
+    }
+    CHECK(!pwgFailed, "engine cycle: no decode failure");
+    CHECK(completes == 1, "engine cycle: exactly ONE completion (2.4.4 cycled forever)");
+    CHECK(enginePasses < 200, "engine cycle: terminates well under the cap");
+    CHECK(q.pendingCount() == 0, "engine cycle: spool empty at the end");
+    CHECK(q.usedBytes() < usedWithJob, "engine cycle: spool file actually removed");
+    // both pages printed + form feeds left the "port"
+    CHECK(sinkOut.size() > 0, "engine cycle: PCL reached the sink");
+    int formFeeds = 0;
+    for (uint8_t b : sinkOut) if (b == 0x0c) formFeeds++;
+    CHECK(formFeeds == 2, "engine cycle: 2 pages -> 2 form feeds");
   }
 
   printf(failures ? "\n%d FAILURES\n" : "\nALL QUEUE TESTS PASSED\n", failures);

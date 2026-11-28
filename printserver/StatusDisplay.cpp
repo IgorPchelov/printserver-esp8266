@@ -166,5 +166,29 @@ void StatusDisplay::render() {
     }
   }
 
+  // --- queued-jobs digit (top-right, 2.4.5): jobs waiting in the spool ---
+  // User request: the box shows "готов" while a job still sits queued (e.g.
+  // waiting behind the current print, or parked when LPT went offline) and
+  // nothing on screen said so. Digit + small "queue" glyph in the top-right
+  // corner; hidden when the queue is empty. Coexists with the busy icon:
+  // the digit goes to the very corner (x>=112) and the busy printer badge
+  // below-left of it; on this 128x32 panel only one of them fits, so while
+  // PRINTING/RECEIVING the busy badge wins (a printing engine implies the
+  // queue state anyway) and the digit shows in every OTHER state.
+  if (queuedJobs > 0 && !busyAnim) {
+    // digit, 12px font, right-aligned against the 128 px edge
+    char qn[4];
+    snprintf(qn, sizeof(qn), "%d", queuedJobs > 99 ? 99 : queuedJobs);
+    uint16_t qw = u8g2->getUTF8Width(qn);
+    u8g2->setFont(u8g2_font_6x12_t_cyrillic);
+    u8g2->drawUTF8(128 - 1 - qw, 12, qn);
+    // tiny inbox glyph left of the digit: a 5x5 tray with the stack count
+    u8g2->drawHLine(128 - 1 - qw - 7, 9, 5);      // tray floor
+    u8g2->drawVLine(128 - 1 - qw - 7, 9, 3);      // tray left wall
+    u8g2->drawVLine(128 - 1 - qw - 3, 9, 3);      // tray right wall
+    if (queuedJobs > 1) u8g2->drawHLine(128 - 1 - qw - 6, 8, 3);  // second sheet
+    if (queuedJobs > 2) u8g2->drawHLine(128 - 1 - qw - 6, 7, 3);  // third sheet
+  }
+
   u8g2->sendBuffer();
 }

@@ -45,6 +45,11 @@ public:
   void setError(const String& e);    // transient error text (g)
   void clearError();
   void setPrinterStatus(LptStatus s);// reflects LPT lines (f/g handled here too)
+  // Jobs waiting in the spool (2.4.5, user request): a digit in the
+  // top-right corner shows jobs still queued while the box says "готов"
+  // - "не напечаталось, а в очереди что-то висит" was invisible on the
+  // OLED until now. Updated from loop() every panel pass; 0 hides it.
+  void setQueuedJobs(int n) { queuedJobs = n; }
   void tick();                       // periodic refresh, animations
   void off();                        // display off (power save)
 
@@ -63,6 +68,7 @@ private:
   // the old uint8_t counter wrapped at 128 half-steps, before a ~200 px line
   // ever finished its sweep (see scrollShift in the .cpp).
   uint32_t animFrame = 0;
+  int queuedJobs = 0;                // spool depth (setQueuedJobs), drawn top-right
   bool dirty = true;
   void render();
 };
