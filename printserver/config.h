@@ -19,7 +19,21 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.4.2"     // 2.4.2: non-blocking print engine - a
+#define FIRMWARE_VERSION "2.4.3"     // 2.4.3: the PWG path (EVERY Android
+                                    //      job) still froze the box: the
+                                    //      decoder wrote to LPT blocking
+                                    //      (120 s budget/byte). PwgToPcl now
+                                    //      emits into a ring buffer and a
+                                    //      pump() drains it under a 20 ms
+                                    //      per-byte budget (OK/HOLD/FAIL
+                                    //      sink contract) - loop() returns
+                                    //      to web/mDNS/OLED between slices;
+                                    //      INIT recovery rate-limited to 1
+                                    //      per 10 s (was a reset storm);
+                                    //      _ipp instance name set via IDF
+                                    //      per-service call (Android never
+                                    //      showed "(IPP)");
+                                    // 2.4.2: non-blocking print engine - a
                                     //      busy/hung printer no longer
                                     //      freezes loop() for 120 s PER BYTE
                                     //      (web UI dead, mDNS dead, box
@@ -163,6 +177,10 @@
                                     // panel/web/mDNS. 20 ms stays invisible to
                                     // print throughput on a real printer.
 #define LPT_PANEL_SERVICE_MS  50UL // panel pump cadence inside busy retries
+#define LPT_INIT_RETRY_MS   10000UL // INIT-pulse recovery rate limit (2.4.3):
+                                    // a hung interface gets ONE reset pulse
+                                    // per 10 s max - never a reset storm on a
+                                    // real printer mid-page
 
 // ---------------------------------------------------------------- Network
 #define HTTP_PORT         80

@@ -116,20 +116,26 @@ void feedByteToLpt(uint8_t b) {
 // DESELECTED the whole job is held (printer offline, wait for SELECT) or
 // dropped (nothing ever wired). Long-busy waits no longer freeze loop():
 // the panel (web/mDNS/OLED/LED) is serviced between single-byte retries.
+// INIT recovery lives in tryInitRecovery() with its own rate limit - a
+// hung printer must not be hammered with reset pulses every 20 ms budget.
 ParallelPort::WriteResult feedByteBudget(uint8_t b, uint32_t budgetMs) {
-  ParallelPort::WriteResult r = lpt.writeByteBudget(b, budgetMs);
-  if (r == ParallelPort::WriteResult::OK) { printBytes++; return r; }
-  if (r == ParallelPort::WriteResult::TIMEOUT) {
-    // a full-budget busy with zero progress and a SELECT present: this is
-    // a hung interface, not page-feed busy. Give it ONE recovery - the
-    // INIT pulse - then report; the engine decides drop vs hold.
-    lpt.resetPrinter();
-    if (lpt.writeByteBudget(b, 50) == ParallelPort::WriteResult::OK) {
-      printBytes++;
-      return ParallelPort::WriteResult::OK;
-    }
-  }
-  return r;
+  return lpt.writeByteBudget(b, budgetMs);
+}
+
+// INIT-pulse recovery for a byte that exhausted its write budget with the
+// printer SELECTED but not accepting (hung interface, not page-feed busy).
+// Rate-limited to one pulse per LPT_INIT_RETRY_MS: the pulse resets the
+// printer's interface logic (IEEE 1284: >= 50 us) and a REAL printer mid-
+// page must not be reset-stormed - one pulse, then minutes of patience.
+// Returns true when the pulse was actually given (caller retries the byte
+// immediately after; the pulse itself often unhangs BUSY).
+bool tryInitRecovery(uint8_t& heldByte) {
+  static uint32_t lastInit = 0;
+  if (millis() - lastInit < LPT_INIT_RETRY_MS) return false;
+  lastInit = millis();
+  (void)heldByte;                     // diagnostic hook: which byte stalls
+  lpt.resetPrinter();
+  return true;
 }
 
 // ---- BOOT button: hold BTN_HOLD_MS to force the configuration AP --------
@@ -193,16 +199,23 @@ uint32_t lastPanelService = 0;
 // every byte to detect job boundaries inside one 512-byte chunk.
 uint32_t engineJobId = 0;
 
-// callback: PCL output byte -> LPT. Same recovery as feedByteToLpt(): a hung
-// BUSY gets one INIT pulse + short retry; if that also fails, return false
-// so the decoder aborts (the job is then dropped via the pwgFailed branch).
-// Returning false used to be pointless - the decoder ignored it and kept
-// stalling 120 s PER OUTPUT BYTE on a dead printer.
-bool pwgOut(void*, uint8_t b) {
-  printBytes++;
-  if (lpt.writeByte(b, LPT_BUSY_TIMEOUT_MS)) return true;
-  lpt.resetPrinter();
-  return lpt.writeByte(b, 2000);
+// callback: PCL output byte -> LPT, non-blocking flavour (2.4.3). The sink
+// contract mirrors the engine's write results: OK = byte sent; HOLD = the
+// port was busy for the whole write budget - byte NOT sent, pump() will
+// retry it; FAIL = port hard-dead (deselected with nothing ever wired).
+// The old sink blocked 120 s per byte, and returning false aborted the
+// whole job on a merely-busy printer.
+PwgToPcl::Sink pwgOut(void*, uint8_t b) {
+  ParallelPort::WriteResult r = lpt.writeByteBudget(b, LPT_BYTE_BUDGET_MS);
+  switch (r) {
+    case ParallelPort::WriteResult::OK:
+      printBytes++;
+      return PwgToPcl::Sink::OK;
+    case ParallelPort::WriteResult::DESELECTED:
+      return PwgToPcl::Sink::FAIL;      // engine holds/drops by port status
+    default:
+      return PwgToPcl::Sink::HOLD;      // busy: retry after panel service
+  }
 }
 
 // Set up (or tear down) the converters for the queue's CURRENT job. Called at
@@ -213,7 +226,12 @@ bool pwgOut(void*, uint8_t b) {
 // and was dropped. Only a single-job queue ever printed correctly.
 void engineSwitchJob() {
   if (pwgActive) {                 // finish the converted job: raster end +
-    pwg.end();                     // form feed flush the last partial page
+    pwg.end();                     // form feed flush the last partial page.
+                                   // end() only QUEUES the epilogue (2.4.3);
+                                   // the pending output still drains through
+                                   // pump() before this job is truly done -
+                                   // the byte loop keeps pwgActive true and
+                                   // pumps until needsPump() clears.
     pwgActive = false;
   }
   engineJobId = queue.currentJobId();
@@ -270,54 +288,78 @@ void processQueue() {
       if (queue.currentJobId() != engineJobId) {
         // hasData() just advanced the reader to the NEXT queued job (the old
         // one is exhausted). Switch converters AT the boundary so the new
-        // job gets its own decoder/raw path - see engineSwitchJob().
+        // job gets its own decoder/raw path - see engineSwitchJob(). The
+        // switch itself must WAIT until the old job's deferred output has
+        // fully drained (pump() to completion): switching early drops the
+        // pending epilogue/form-feed of the last page (2.4.3).
+        if (pwgActive && pwg.needsPump()) {
+          PwgToPcl::Feed pf = pwg.pump(LPT_BYTE_BUDGET_MS);
+          if (pf == PwgToPcl::Feed::HELD) return;     // port busy: later pass
+          if (pf == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
+          continue;                                    // drained: switch now
+        }
         engineSwitchJob();
       }
+      // ---- PWG path: decode input / pump output, both bounded (2.4.3) ----
+      // feed() never blocks on the port: PCL bytes land in the decoder's
+      // ring and leave ONLY through pump() with a write budget per byte.
+      // Backpressure (HELD / needsPump) returns to loop() - web panel,
+      // mDNS, OLED and LED stay serviced while the printer chews.
+      if (pwgActive) {
+        if (pwg.needsPump()) {
+          PwgToPcl::Feed pf = pwg.pump(LPT_BYTE_BUDGET_MS);
+          if (pf == PwgToPcl::Feed::HELD) return;       // port busy: later pass
+          if (pf == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
+          continue;                                      // ring drained: feed more
+        }
+        int b = queue.readByte();
+        if (b < 0) break;                                // input exhausted
+        PwgToPcl::Feed f = pwg.feed((uint8_t)b);
+        if (f == PwgToPcl::Feed::FAIL) { pwgFailed = true; break; }
+        // OK / HELD: the byte was consumed either way; HELD pauses INPUT
+        // until pump() drains the ring - the engine never re-feeds it.
+        if (f == PwgToPcl::Feed::HELD) return;
+        n++;
+        continue;
+      }
+      // ---- RAW path: per-byte budget, same non-blocking discipline ----
       int b = queue.readByte();
       if (b < 0) break;
-      if (pwgActive) {
-        if (!pwg.feed((uint8_t)b)) { pwgFailed = true; break; }
-        // pwgOut() already counts the CONVERTED bytes actually pushed to the
-        // port; counting the source bytes here too would double-increment.
-        // A deferred (busy) OUTPUT byte cannot be replayed through the
-        // decoder: pwgOut() already consumed the raster input. The decoder
-        // stalls instead (PwgToPcl's own output stall handling reports the
-        // error and the job drops as "output stalled") - PWG jobs on a
-        // busy port are rare enough (Android renders ahead of the port).
-      } else {
-        // NON-BLOCKING raw path (2.4.2): a small per-byte budget, then
-        // return to loop() - web/mDNS/OLED keep running while the printer
-        // chews on the last byte. The deferred byte goes back to the queue
-        // (pushback) and is retried on the next pass.
-        ParallelPort::WriteResult r = feedByteBudget((uint8_t)b, LPT_BYTE_BUDGET_MS);
-        if (r == ParallelPort::WriteResult::TIMEOUT) {
-          queue.pushback();              // same byte again, later pass
-          if (millis() - lastPanelService > LPT_PANEL_SERVICE_MS) {
-            panelPump();                 // OLED/LED/LPT poll/button live
-            lastPanelService = millis();
-          }
-          return;                        // give loop() the rest of the slice
-        }
-        if (r == ParallelPort::WriteResult::DESELECTED) {
-          // SELECT fell for a solid second: printer off / offline. Wired
-          // before -> hold the job (resumes when SELECT returns); never
-          // wired -> dead port, drop with the honest reason.
-          if (lpt.selectEverWired()) {
-            display.setPrinterStatus(LptStatus::OFFLINE);
-            queue.pushback();
-            return;                      // hold; processQueue re-checks above
-          }
-          queue.dropCurrent();
-          engState = EngineState::IDLE;
-          display.setError("нет ответа LPT");
-          display.setState(uiFor(engState));
-          return;
-        }
-        printBytes++;
+      // NON-BLOCKING raw path (2.4.2): a small per-byte budget, then
+      // return to loop() - web/mDNS/OLED keep running while the printer
+      // chews on the last byte. The deferred byte goes back to the queue
+      // (pushback) and is retried on the next pass.
+      ParallelPort::WriteResult r = feedByteBudget((uint8_t)b, LPT_BYTE_BUDGET_MS);
+      if (r == ParallelPort::WriteResult::TIMEOUT) {
+        queue.pushback();              // same byte again, later pass
+        tryInitRecovery(*(uint8_t*)&b); // rate-limited INIT recovery (2.4.3)
+        return;                        // give loop() the rest of the slice
       }
+      if (r == ParallelPort::WriteResult::DESELECTED) {
+        // SELECT fell for a solid second: printer off / offline. Wired
+        // before -> hold the job (resumes when SELECT returns); never
+        // wired -> dead port, drop with the honest reason.
+        if (lpt.selectEverWired()) {
+          display.setPrinterStatus(LptStatus::OFFLINE);
+          queue.pushback();
+          return;                      // hold; processQueue re-checks above
+        }
+        queue.dropCurrent();
+        engState = EngineState::IDLE;
+        display.setError("нет ответа LPT");
+        display.setState(uiFor(engState));
+        return;
+      }
+      printBytes++;
       n++;
     }
     if (engState != EngineState::PRINTING) return;   // dropped mid-job above
+    // PWG job completes only when BOTH the input is exhausted AND the
+    // output ring is fully drained (pump() ran to completion after the
+    // last end()). hasData() advanced the queue at input-EOF, so the
+    // completion check below sees the NEXT job; the draining condition
+    // guards the boundary.
+    if (pwgActive && pwg.needsPump()) return;        // ring still draining
     if (!queue.hasData() && !pwgFailed) {
       if (pwgActive) { pwg.end(); pwgActive = false; }
       queue.markJobState(engineJobId, 9);   // completed: last job printed
@@ -1047,11 +1089,17 @@ void setup() {
   // showed two identical "ESP32-S3 WiFi-to_LPT print server" entries and
   // there was no telling which is IPP and which the raw socket. The suffix
   // tells the user which endpoint a picked entry talks to. Arduino's
-  // MDNS.setInstanceName sets ONE global name for all services, so the
-  // second (socket) name goes through the IDF API the wrapper is built on.
+  // MDNS.setInstanceName sets ONE global name for all services, so BOTH
+  // per-service names go through the IDF API the wrapper is built on:
+  // in ESP-IDF the global instance name only stamps services added while
+  // it is set (mdns_service_add copies it at creation), and the Arduino
+  // wrapper adds services AFTER the setter - relying on the global call
+  // made the _ipp entry show up with a stale/cached name on Android
+  // (2.4.3 field report: "(IPP)" never visible). Setting the instance
+  // name per service, explicitly, fixes both entries deterministically.
   if (MDNS.begin(NetService::hostName().c_str())) {
-    MDNS.setInstanceName(PRINTER_NAME);            // base name for _ipp
     MDNS.addService("ipp", "tcp", IPP_PORT);
+    mdns_service_instance_name_set("_ipp", "_tcp", PRINTER_NAME);
     MDNS.addServiceTxt("ipp", "tcp", "rp", "lp");
     MDNS.addServiceTxt("ipp", "tcp", "note", PRINTER_NAME);
     MDNS.addServiceTxt("ipp", "tcp", "UUID",

@@ -11,10 +11,52 @@
 // ---- capture output ----
 static std::vector<uint8_t> outBytes;
 static int lptTimeouts = 0;
-bool fakeLpt(void*, uint8_t b) {
-  if (lptTimeouts > 0) return false;
+// Sink verdict emulation: lptTimeouts>0 -> FAIL (dead port); lptHolds>0 ->
+// HOLD for the first lptHolds bytes (busy port), then OK.
+static int lptHolds = 0;
+static int holderN = 0;
+PwgToPcl::Sink heldSink(void*, uint8_t b) {
+  if (++holderN % 3 == 0) return PwgToPcl::Sink::HOLD;   // busy this byte
   outBytes.push_back(b);
+  return PwgToPcl::Sink::OK;
+}
+
+PwgToPcl::Sink fakeLpt(void*, uint8_t b) {
+  if (lptTimeouts > 0) return PwgToPcl::Sink::FAIL;
+  if (lptHolds > 0) { lptHolds--; return PwgToPcl::Sink::HOLD; }
+  outBytes.push_back(b);
+  return PwgToPcl::Sink::OK;
+}
+
+// Feed a whole document with the engine's discipline: never feed while
+// output is pending; pump between feeds; drain fully at the end. Returns
+// false on FAIL (the lastError explains), and counts HELD pauses.
+static int heldPauses = 0;
+bool feedDoc(PwgToPcl& c, const std::vector<uint8_t>& doc) {
+  for (uint8_t b : doc) {
+    if (c.needsPump()) {
+      PwgToPcl::Feed pf = c.pump(1000);
+      if (pf == PwgToPcl::Feed::FAIL) return false;
+      if (pf == PwgToPcl::Feed::HELD) { heldPauses++; }
+    }
+    PwgToPcl::Feed f = c.feed(b);
+    if (f == PwgToPcl::Feed::FAIL) return false;
+    // HELD: the byte was consumed; keep feeding (test sinks never hold
+    // longer than one byte, so input continues right after the pause)
+    if (f == PwgToPcl::Feed::HELD) { heldPauses++; }
+  }
   return true;
+}
+
+// Drain to completion after end(): pump until OK, HELD never settles
+// (test sinks never hold forever), FAIL returns false.
+bool drainDoc(PwgToPcl& c) {
+  for (;;) {
+    PwgToPcl::Feed pf = c.pump(1000);
+    if (pf == PwgToPcl::Feed::OK) return !c.needsPump();
+    if (pf == PwgToPcl::Feed::FAIL) return false;
+    if (pf == PwgToPcl::Feed::HELD) heldPauses++;
+  }
 }
 
 static void be32(std::vector<uint8_t>& v, uint32_t x) {
@@ -69,10 +111,10 @@ int main() {
   // ---------- run the converter ----------
   PwgToPcl conv;
   conv.begin(fakeLpt, nullptr);
-  bool ok = true;
-  for (uint8_t b : doc) { if (!conv.feed(b)) { ok = false; break; } }
+  bool ok = feedDoc(conv, doc);
   CHECK(ok, "converter consumed the whole stream without error");
   conv.end();
+  CHECK(drainDoc(conv), "output fully drained after end()");
 
   printf("info: pages=%u rows=%u outBytes=%zu\n",
          conv.pagesPrinted(), conv.rowsPrinted(), outBytes.size());
@@ -125,7 +167,7 @@ int main() {
   for (char ch : {'X','a','S','2'}) { }        // (silence unused warnings)
   PwgToPcl bad2;
   bad2.begin(fakeLpt, nullptr);
-  for (char ch : std::string("RaS3")) if (!bad2.feed((uint8_t)ch)) ok2 = false;
+  for (char ch : std::string("RaS3")) { if (bad2.feed((uint8_t)ch) == PwgToPcl::Feed::FAIL) ok2 = false; }
   CHECK(!ok2 && !strcmp(bad2.lastError(), "bad sync"), "bad sync detected");
 
   // ---------- wide line: full A4 width 300dpi (regression) ----------
@@ -160,9 +202,10 @@ int main() {
     PwgToPcl c2;
     c2.begin(fakeLpt, nullptr);
     bool okw = true;
-    for (uint8_t b : d2) if (!c2.feed(b)) { okw = false; break; }
+    okw = feedDoc(c2, d2);
     CHECK(okw, "wide 2480-px 8-bpp page accepted (old code rejected >300 px)");
     c2.end();
+    CHECK(drainDoc(c2), "c2: output drained after end()");
     CHECK(c2.rowsPrinted() == H, "wide page: all rows emitted");
     CHECK(!strcmp(c2.lastError(), ""), "wide page: no error");
   }
@@ -196,9 +239,10 @@ int main() {
     PwgToPcl c3;
     c3.begin(fakeLpt, nullptr);
     bool ok3 = true;
-    for (uint8_t b : d3) if (!c3.feed(b)) { ok3 = false; break; }
+    ok3 = feedDoc(c3, d3);
     CHECK(ok3, "black_1 page accepted");
     c3.end();
+    CHECK(drainDoc(c3), "c3: output drained after end()");
     CHECK(c3.rowsPrinted() == 1, "black_1: one row emitted");
     std::string s3(outBytes.begin(), outBytes.end());
     size_t p3 = s3.find("\x1b*b8W");
@@ -245,9 +289,10 @@ int main() {
     PwgToPcl c4;
     c4.begin(fakeLpt, nullptr);
     bool ok4 = true;
-    for (uint8_t b : d4) if (!c4.feed(b)) { ok4 = false; break; }
+    ok4 = feedDoc(c4, d4);
     CHECK(ok4, "srgb_8 page accepted");
     c4.end();
+    CHECK(drainDoc(c4), "c4: output drained after end()");
     CHECK(c4.rowsPrinted() == 1, "srgb_8: one row emitted");
     std::string s4(outBytes.begin(), outBytes.end());
     size_t p4 = s4.find("\x1b*b2W");           // 16 px -> 2 bytes/row
@@ -276,7 +321,7 @@ int main() {
     memcpy(&h5[0], "PwgRaster", 9);
     d5.insert(d5.end(), h5.begin(), h5.end());
     bool ok5 = true;
-    for (uint8_t b : d5) if (!c5.feed(b)) { ok5 = false; break; }
+    ok5 = feedDoc(c5, d5);
     CHECK(!ok5 && !strcmp(c5.lastError(), "unsupported colorspace"),
           "CMYK raster rejected with a clear reason, not garbage");
   }
@@ -308,9 +353,10 @@ int main() {
     PwgToPcl c6;
     c6.begin(fakeLpt, nullptr);
     bool ok6 = true;
-    for (uint8_t b : d6) if (!c6.feed(b)) { ok6 = false; break; }
+    ok6 = feedDoc(c6, d6);
     CHECK(ok6, "Letter-width (2550 px) black_1 page accepted");
     c6.end();
+    CHECK(drainDoc(c6), "c6: output drained after end()");
     CHECK(c6.rowsPrinted() == H, "Letter black_1: both rows emitted");
     std::string s6(outBytes.begin(), outBytes.end());
     const std::string marker6 = "\x1b*b319W";
@@ -352,9 +398,10 @@ int main() {
     PwgToPcl c7;
     c7.begin(fakeLpt, nullptr);
     bool ok7 = true;
-    for (uint8_t b : d7) if (!c7.feed(b)) { ok7 = false; break; }
+    ok7 = feedDoc(c7, d7);
     CHECK(ok7, "srgb_8 repeat-run row accepted");
     c7.end();
+    CHECK(drainDoc(c7), "c7: output drained after end()");
     CHECK(c7.rowsPrinted() == 1, "srgb_8 repeat-run: the row is not lost");
     std::string s7(outBytes.begin(), outBytes.end());
     size_t p7 = s7.find("\x1b*b1W");
@@ -388,7 +435,7 @@ int main() {
     PwgToPcl c8;
     c8.begin(fakeLpt, nullptr);
     bool ok8 = true;
-    for (uint8_t b : d8) if (!c8.feed(b)) { ok8 = false; break; }
+    ok8 = feedDoc(c8, d8);
     CHECK(!ok8 && !strcmp(c8.lastError(), "line too wide"),
           "600dpi A4 black_1 refused honestly (would overflow pclRow)");
   }
@@ -428,9 +475,10 @@ int main() {
     PwgToPcl c9;
     c9.begin(fakeLpt, nullptr);
     bool ok9 = true;
-    for (uint8_t b : d9) if (!c9.feed(b)) { ok9 = false; break; }
+    ok9 = feedDoc(c9, d9);
     CHECK(ok9, "full-width srgb_8 A4 page accepted (lineBuf sized for 3 B/px)");
     c9.end();
+    CHECK(drainDoc(c9), "c9: output drained after end()");
     CHECK(c9.rowsPrinted() == 1, "full-width srgb_8: row emitted");
     CHECK(!strcmp(c9.lastError(), ""), "full-width srgb_8: no error");
     // the 2480-px row packs into 310 bytes, all black
@@ -479,9 +527,10 @@ int main() {
     PwgToPcl c10;
     c10.begin(fakeLpt, nullptr);
     bool ok10 = true;
-    for (uint8_t b : d10) if (!c10.feed(b)) { ok10 = false; break; }
+    ok10 = feedDoc(c10, d10);
     CHECK(ok10, "multi-page: stream consumed without error");
     c10.end();
+    CHECK(drainDoc(c10), "c10: output drained after end()");
     CHECK(c10.pagesPrinted() == 2, "multi-page: exactly 2 pages emitted");
     CHECK(!strcmp(c10.lastError(), ""), "multi-page: no error");
     std::string s10(outBytes.begin(), outBytes.end());
@@ -517,7 +566,7 @@ int main() {
     PwgToPcl c11;
     c11.begin(fakeLpt, nullptr);
     bool ok11 = true;
-    for (uint8_t b : d11) if (!c11.feed(b)) { ok11 = false; break; }
+    ok11 = feedDoc(c11, d11);
     CHECK(!ok11, "output failure aborts the conversion");
     CHECK(!strcmp(c11.lastError(), "output stalled"), "abort reason is 'output stalled'");
     lptTimeouts = 0;                           // restore for later tests
@@ -543,7 +592,7 @@ int main() {
     memcpy(&h[0], "PwgRaster", 9);
     d12.insert(d12.end(), h.begin(), h.end());
     bool ok12 = true;
-    for (uint8_t b : d12) if (!c12.feed(b)) { ok12 = false; break; }
+    ok12 = feedDoc(c12, d12);
     CHECK(!ok12 && !strcmp(c12.lastError(), "unsupported bit depth"),
           "16-bit gray refused with a clear reason, not garbage rows");
   }
@@ -572,13 +621,74 @@ int main() {
       d.push_back(0); d.push_back(0); d.push_back(0x00);
       PwgToPcl c;
       c.begin(fakeLpt, nullptr);
-      for (uint8_t b : d) c.feed(b);
+      feedDoc(c, d);
       c.end();
+      drainDoc(c);
       std::string s(outBytes.begin(), outBytes.end());
       CHECK(s.find(expect) != std::string::npos && s.find(absent) == std::string::npos, msg);
     };
     pageSizeTest(612, "\x1b&l2A", "\x1b&l26A", "Letter (612 pt) -> PCL code 2A, not 26A");
     pageSizeTest(595, "\x1b&l26A", "\x1b&l2A;", "A4 (595 pt) -> PCL code 26A");
+  }
+
+  // ---------- non-blocking pipeline (2.4.3): HOLD, dosing, no byte lost ------
+  // A busy port (sink returns HOLD for stretches of bytes) must never lose
+  // or duplicate output: every held byte is retried by pump() and the
+  // document's output must equal the unheld run byte-for-byte.
+  {
+    outBytes.clear();
+    heldPauses = 0;
+    const uint32_t W = 64, H = 8;
+    std::vector<uint8_t> d13;
+    d13.push_back('R'); d13.push_back('a'); d13.push_back('S'); d13.push_back('2');
+    std::vector<uint8_t> h13(PWG_HDR_SIZE, 0);
+    auto p13 = [&](uint16_t off, uint32_t val) {
+      h13[off] = val >> 24; h13[off+1] = val >> 16; h13[off+2] = val >> 8; h13[off+3] = val;
+    };
+    p13(PWG_OFF_HWRES_X, 300); p13(PWG_OFF_HWRES_Y, 300);
+    p13(PWG_OFF_WIDTH, W); p13(PWG_OFF_HEIGHT, H);
+    p13(PWG_OFF_BPP, 8); p13(PWG_OFF_BYTESLINE, W);
+    p13(PWG_OFF_COLORSPACE, 18);
+    memcpy(&h13[0], "PwgRaster", 9);
+    d13.insert(d13.end(), h13.begin(), h13.end());
+    for (uint32_t r = 0; r < H; r++) {
+      d13.push_back(0);                       // row once
+      d13.push_back(63); d13.push_back(0x00); // repeat 64 black px
+    }
+    // baseline: clean run
+    PwgToPcl base;
+    base.begin(fakeLpt, nullptr);
+    feedDoc(base, d13);
+    base.end();
+    drainDoc(base);
+    std::string baseline(outBytes.begin(), outBytes.end());
+    size_t baselineRows = base.rowsPrinted(), baselinePages = base.pagesPrinted();
+
+    // held run: sink refuses every 3rd byte once (HOLD), pump retries it
+    outBytes.clear(); holderN = 0;
+    PwgToPcl held;
+    held.begin(heldSink, nullptr);
+    bool okh = true;
+    for (uint8_t b : d13) {
+      if (held.needsPump()) {
+        PwgToPcl::Feed pf = held.pump(1000);
+        if (pf == PwgToPcl::Feed::FAIL) { okh = false; break; }
+      }
+      PwgToPcl::Feed f = held.feed(b);
+      if (f == PwgToPcl::Feed::FAIL) { okh = false; break; }
+    }
+    held.end();
+    for (;;) {
+      PwgToPcl::Feed pf = held.pump(1000);
+      if (pf == PwgToPcl::Feed::OK) break;
+      if (pf == PwgToPcl::Feed::FAIL) { okh = false; break; }
+    }
+    CHECK(okh, "held pipeline: document consumed despite HOLD backpressure");
+    std::string heldOut(outBytes.begin(), outBytes.end());
+    CHECK(heldOut == baseline,
+          "held pipeline: output is byte-identical to the unheld run");
+    CHECK(held.rowsPrinted() == baselineRows && held.pagesPrinted() == baselinePages,
+          "held pipeline: same rows/pages as the unheld run");
   }
 
   printf(failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
