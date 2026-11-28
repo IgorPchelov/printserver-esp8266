@@ -1,14 +1,17 @@
 #!/bin/sh
 # Host unit tests (no hardware needed)
-#   test_pwg   - PWG-raster -> PCL converter (PwgToPcl.h)
-#   test_queue - spool queue logic (PrintQueue.cpp) on a REAL littlefs
-#                in RAM (host_littlefs/ shim, littlefs v2.9 vendored)
-#   test_scroll- OLED ping-pong scroll trajectory (StatusDisplay.cpp linked
-#                against the host_syntax stubs)
-#   test_web  - web panel page builders (WebPages.h): OTA /update page,
-#                one-endpoint-per-row table, POST /update refusal rules
-#   syntax     - g++ -fsyntax-only of every firmware module via stubs
-#                (host_syntax/), so .ino edits are compile-checked too
+#   test_pwg     - PWG-raster -> PCL converter (PwgToPcl.h)
+#   test_queue   - spool queue logic (PrintQueue.cpp) on a REAL littlefs
+#                  in RAM (host_littlefs/ shim, littlefs v2.9 vendored)
+#   test_ippbody - IPP transport body reader (IppBody.h): Content-Length
+#                  and chunked decode, truncation flags (the 2.4.0 fix for
+#                  Android chunked requests mis-parsed off the raw socket)
+#   test_scroll  - OLED ping-pong scroll trajectory (StatusDisplay.cpp linked
+#                  against the host_syntax stubs)
+#   test_web     - web panel page builders (WebPages.h): OTA /update page,
+#                  one-endpoint-per-row table, POST /update refusal rules
+#   syntax       - g++ -fsyntax-only of every firmware module via stubs
+#                  (host_syntax/), so .ino edits are compile-checked too
 cd "$(dirname "$0")"
 rc=0
 
@@ -22,6 +25,10 @@ g++ -std=c++17 -w -I. -Ihost_littlefs -o test_queue \
     -x c host_littlefs/littlefs/lfs_util.c -x none && ./test_queue 2>&1 \
     | grep -v "littlefs/lfs.c:.*error:" || rc=1
 
+echo "== IPP transport body tests =="
+g++ -std=c++17 -w -I. -o test_ippbody \
+    test_ippbody.cpp ../IppBody.cpp && ./test_ippbody || rc=1
+
 echo "== OLED scroll trajectory tests =="
 g++ -std=c++17 -w -I. -I.. -Ihost_syntax/stubs -o test_scroll \
     test_scroll.cpp ../StatusDisplay.cpp ../ParallelPort.cpp \
@@ -34,7 +41,7 @@ g++ -std=c++17 -w -I. -I.. -Ihost_syntax/stubs -o test_web \
 
 echo "== firmware syntax check =="
 for f in printserver.ino ParallelPort.cpp PrintQueue.cpp NetService.cpp \
-         StatusDisplay.cpp StatusLed.cpp; do
+         StatusDisplay.cpp StatusLed.cpp IppBody.cpp; do
   g++ -std=c++17 -fsyntax-only -I host_syntax/stubs -x c++ "../$f" || rc=1
 done
 echo "syntax check done (no output above = clean)"

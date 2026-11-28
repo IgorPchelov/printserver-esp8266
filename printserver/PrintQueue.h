@@ -44,6 +44,9 @@ public:
   bool currentJobIsPwg()   const { return curIsPwg; }   // true = needs PWG->PCL conversion
   uint32_t jobsDone()      const { return doneCount; }
   void dropCurrent();                         // delete job being read (error path)
+  // Cancel-Job support: remove a WAITING job by spool id. Mid-print jobs
+  // are refused (LPT has no pause/resume); unknown ids return false.
+  bool removeJobById(uint32_t id);
   size_t usedBytes() const;
   int pendingCount() const { return pending; }
   // How many queued jobs (both flavours) the last begin() removed from /q

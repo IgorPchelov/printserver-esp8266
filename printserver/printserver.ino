@@ -41,6 +41,11 @@
 #include "NetService.h"
 #include "PwgToPcl.h"
 #include "WebPages.h"
+#include "IppBody.h"
+// per-service mDNS instance names (Android shows two entries otherwise both
+// named the same); the Arduino ESPmDNS wrapper only sets ONE global instance,
+// so call the IDF API it is built on directly for the second service
+#include "mdns.h"
 
 ParallelPort lpt;
 StatusDisplay display;
@@ -58,6 +63,10 @@ NetService net;
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClients[MAX_RAW_CLIENTS];
 bool rawActive[MAX_RAW_CLIENTS];
+// 2.4.0 lazy spool: true once the slot's first byte opened the spool file.
+// A raw connection that never sends (Android printer probing) stays at
+// false and leaves no .tmp behind.
+bool rawSpooled[MAX_RAW_CLIENTS] = {false};
 // last time each raw slot saw a byte. A slot whose client goes silent for
 // RAW_IDLE_TIMEOUT_MS (crashed sender / half-open TCP that never FINs) is
 // reaped below - without this, four such ghosts wedge every slot and the
@@ -492,12 +501,58 @@ void handleHttp(WiFiClient c) {
 }
 
 // ---------------- minimal IPP (RFC 8011 subset) ----------------
-// Supports: Get-Printer-Attributes, Validate-Job, Print-Job.
-// Print-Job data is spooled raw (PCL/PJL passthrough). If the client sends
+// Supports: Get-Printer-Attributes, Validate-Job, Print-Job, Create-Job +
+// Send-Document (the two-step flavour Android's IPP stack actually uses),
+// Get-Job-Attributes, Get-Jobs, Cancel-Job (client-side cancel).
+// Print data is spooled raw (PCL/PJL passthrough). If the client sends
 // image/pwg-raster (Android's built-in print service does, since we
 // advertise it), the spooled file is converted to PCL at print time - see
 // processQueue() and PwgToPcl.h.
+//
+// All body reads go through ipp::BodyStream (IppBody.h) so a chunked
+// Transfer-Encoding is decoded for the IPP header AND attribute groups
+// too - the old code read chunk-size lines as IPP bytes, got garbage
+// operation ids and rejected valid jobs (2.4.0).
+
+// live spool handles for Send-Document: job created by Create-Job, waiting
+// for its document. slot == -1 = none. Only ONE at a time: Android sends
+// Create-Job -> Send-Document back to back on the SAME connection pool.
+static int ippOpenSlot = -1;
+static uint32_t ippOpenJobId = 0;
+static uint32_t ippOpenSince = 0;
+// Create-Job->Send-Document pairing needs the job-id from the LAST
+// Create-Job response; when a Create-Job call comes with an open spool
+// already hanging (client died between the two calls), the stale spool
+// is dropped first (removeJobById, below).
+static uint32_t ippLastCreatedId = 0;
+
+// status code -> short serial text so every IPP answer line says its verdict
+const char* ippStatusText(uint16_t st) {
+  switch (st) {
+    case 0x0000: return "successful-ok";
+    case 0x0400: return "client-error-bad-request";
+    case 0x0404: return "client-error-not-found";
+    case 0x040C: return "client-error-operation-not-supported";
+    case 0x0408: return "client-error-request-too-long";
+    case 0x0503: return "server-error-device-error";
+    case 0x0506: return "server-error-not-accepting-jobs";
+    default:     return "status-(unknown)";
+  }
+}
+
+// Wrap the accepted WiFiClient in the host-testable BodySource interface.
+struct IppClientSource : public ipp::BodySource {
+  WiFiClient c;
+  explicit IppClientSource(WiFiClient client) : c(client) {}
+  int  read(uint8_t* buf, size_t n) override { return c.read(buf, n); }
+  int  available() override { return c.available(); }
+  bool connected() override { return c.connected(); }
+  void pump() override { panelPump(); }
+};
+
 void handleIpp(WiFiClient c) {
+  IppClientSource src(c);
+
   // ---- parse HTTP headers (content-length or chunked) ----
   int contentLength = -1;
   bool chunked = false;
@@ -506,8 +561,9 @@ void handleIpp(WiFiClient c) {
   // Minimal request line the client actually sent - Android adds a printer
   // by bare IP and probes ports; when a job never arrives ("q=0" in the
   // [dbg] line, no [ipp] log at all) the probe/POST line tells whether the
-  // phone reached the box at all and which path it hit.
-  Serial.println(String("[ipp] ") + reqLine.substring(0, 60));
+  // phone reached the box at all and which path it hit. Empty request lines
+  // (the [ipp] blank in the field log) are TCP keepalives from port probes.
+  Serial.println(String("[ipp] ") + (reqLine.length() ? reqLine.substring(0, 60) : "(empty line - port probe)"));
   // Line-capped like handleHttp: see the comment there.
   for (int lines = 0; c.connected() && lines < 40; lines++) {
     String h = c.readStringUntil('\r'); c.readStringUntil('\n');
@@ -517,39 +573,61 @@ void handleIpp(WiFiClient c) {
     else if (h.startsWith("transfer-encoding:") && h.indexOf("chunked") >= 0) chunked = true;
     else if (h.startsWith("expect:") && h.indexOf("100-continue") >= 0) expect100 = true;
   }
-  if (contentLength == -1 && !chunked) { c.stop(); return; }
+  if (contentLength == -1 && !chunked) {
+    Serial.println("[ipp] refused: neither Content-Length nor chunked framing - 400");
+    // answer, do not just drop the socket: a silently dropped connection is
+    // indistinguishable from a dead box and the client retries forever
+    c.printf("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    c.stop();
+    return;
+  }
 
   if (expect100) c.print("HTTP/1.1 100 Continue\r\n\r\n");
 
-  // IPP body: version(2) op(2) reqid(4) attr-groups...
-  // Every wait below pumps panelPump(): an Android PWG job runs for tens of
-  // seconds, and without it the OLED freezes mid-frame, the BOOT button
-  // ignores a hold and the LPT status lines stop being polled for exactly
-  // the duration of the transfer.
+  // ---- IPP body over ONE transport view (Content-Length or chunked) ----
+  // BodyStream de-chunks EVERYTHING that follows - header, attribute groups
+  // and (in the spool path) the document - so the parsing code below never
+  // sees a chunk boundary as an IPP byte (2.4.0; the old code parsed the
+  // raw socket and mis-parsed chunked requests).
+  ipp::Framing framing = chunked ? ipp::Framing::CHUNKED : ipp::Framing::LENGTH;
+  ipp::BodyStream bs(src, framing, contentLength, 10000);
+  size_t hdrGot = 0;
   uint8_t hdr[8];
-  size_t got = 0;
-  uint32_t t0 = millis();
-  while (got < 8 && millis() - t0 < 5000) {
-    if (c.available()) hdr[got++] = c.read(); else panelPump();
+  while (hdrGot < 8) {
+    int r = bs.read(hdr + hdrGot, 8 - hdrGot);
+    if (r > 0) { hdrGot += (size_t)r; continue; }
+    if (r == 0 && c.connected()) { continue; }     // wait state (pump ran)
+    Serial.println("[ipp] refused: IPP header never arrived - 400");
+    c.printf("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    c.stop();
+    return;
   }
-  if (got < 8) { c.stop(); return; }
   uint16_t opId = (hdr[2] << 8) | hdr[3];
   uint32_t reqId = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16) | ((uint32_t)hdr[6] << 8) | hdr[7];
 
-  bool spooling = (opId == 0x0002);   // Print-Job
+  bool createJob = (opId == 0x0005);  // Create-Job
+  bool sendDoc   = (opId == 0x0006);  // Send-Document
   int slot = -1;
-  if (spooling) {
-    // Check free space BEFORE accepting: without this the job would spool to
-    // a full flash, endJob would keep a truncated file and the print would
-    // come out cut mid-page with a success response to the client.
+  if (createJob) {
+    // Same capacity gate as raw-accept and Print-Job.
     for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
-    if (slot >= 0 && (!queue.canStore() || !queue.startJob(slot))) slot = -1;   // disk full / open failed
+    if (slot >= 0 && (!queue.canStore() || !queue.startJob(slot))) slot = -1;
     if (slot >= 0) {
       rawActive[slot] = true;
-      // RECEIVING only from IDLE: clobbering PRINTING here would pause the
-      // in-flight job, and its later IDLE->PRINTING restart calls pwg.begin()
-      // on a reader that is mid-file -> "bad sync" -> the job is dropped.
-      // Spool-and-print concurrently instead: the queue is designed for it.
+      ippOpenSlot = slot; ippOpenJobId = queue.jobId(slot); ippOpenSince = millis();
+      ippLastCreatedId = ippOpenJobId;
+      if (engState == EngineState::IDLE) {
+        engState = EngineState::RECEIVING;
+        display.setState(UiState::RECEIVING);
+      }
+    }
+  } else if (sendDoc) {
+    // Pair with the job Create-Job opened. Android does Create-Job ->
+    // Send-Document on the same connection; the job-id attribute in the
+    // request may be absent (implicit "last created").
+    if (ippOpenSlot >= 0 && !rawActive[ippOpenSlot]) ippOpenSlot = -1;  // stale
+    slot = ippOpenSlot;
+    if (slot >= 0) {
       if (engState == EngineState::IDLE) {
         engState = EngineState::RECEIVING;
         display.setState(UiState::RECEIVING);
@@ -561,42 +639,44 @@ void handleIpp(WiFiClient c) {
   // While walking, remember the requested document-format so we know whether
   // the incoming document is PWG raster (Android) or raw PCL (desktops).
   String docFormat = "application/octet-stream";
+  uint32_t reqJobId = 0;      // Send-Document/Cancel/Get-Job-Attributes target
   bool inOpGroup = true;   // first group after header is operation-attributes
   {
-    uint32_t tWalk = millis();
-    while (millis() - tWalk < 10000) {
-      int b = -1;
-      // read with timeout helper; bail early if the peer died mid-request
-      // (connected() is false only with the buffer already drained - no
-      // point spinning to the 10 s cap with the socket gone)
-      while ((b = c.available()) == 0) {
-        if (millis() - tWalk > 10000) break;
-        if (!c.connected()) break;
-        panelPump();               // keep OLED/LED/LPT/button alive (see above)
-      }
-      if (b <= 0 && !c.available()) break;
-      int tag = c.read();
+    // bounded by the transport: BodyStream ends at the body end; a peer
+    // that stalls mid-attributes is cut off by its idle timeout (10 s)
+    while (true) {
+      uint8_t tb;
+      int r = bs.read(&tb, 1);
+      if (r < 0) break;
+      int tag = tb;
       if (tag == 0x03) break;                       // end of attributes
       if (tag >= 0x01 && tag <= 0x05) { inOpGroup = (tag == 0x01); continue; }
       if (tag < 0x10) break;                        // out of spec; bail to data
       // value-tag: read name-len, name, value-len, value
       auto readU16 = [&]() -> uint16_t {
-        while (c.available() < 2 && millis() - tWalk < 10000) panelPump();
-        if (c.available() < 2) return 0xFFFF;
-        uint16_t hi = c.read(); return (hi << 8) | c.read();
+        uint8_t b2[2];
+        if (bs.read(b2, 2) != 2) return 0xFFFF;
+        return (uint16_t)((b2[0] << 8) | b2[1]);
       };
       uint16_t nlen = readU16();
       String name;
       if (nlen != 0 && nlen != 0xFFFF) {
-        while (c.available() < nlen && millis() - tWalk < 10000) panelPump();
-        for (uint16_t i = 0; i < nlen && c.available(); i++) name += (char)c.read();
+        for (uint16_t i = 0; i < nlen; i++) {
+          uint8_t ch;
+          if (bs.read(&ch, 1) != 1) { nlen = 0xFFFF; break; }
+          name += (char)ch;
+        }
       }
       uint16_t vlen = readU16();
+      String val;
       if (vlen != 0xFFFF) {
-        while (c.available() < vlen && millis() - tWalk < 10000) panelPump();
-        String val;
-        for (uint16_t i = 0; i < vlen && c.available(); i++) val += (char)c.read();
+        for (uint16_t i = 0; i < vlen; i++) {
+          uint8_t ch;
+          if (bs.read(&ch, 1) != 1) { vlen = 0xFFFF; break; }
+          val += (char)ch;
+        }
         if (inOpGroup && name == "document-format") docFormat = val;
+        if (inOpGroup && name == "job-id") reqJobId = (uint32_t)val.toInt();
       }
       if (nlen == 0xFFFF || vlen == 0xFFFF) break;
     }
@@ -652,7 +732,12 @@ void handleIpp(WiFiClient c) {
   attrStr(0x47, "attributes-charset", "utf-8");
   attrStr(0x48, "attributes-natural-language", "en-us");
 
-  if (opId == 0x000B || opId == 0x0004 || opId == 0x0002) {  // Get attrs / validate / print
+  bool supported = (opId == 0x000B || opId == 0x0004 || opId == 0x0002 ||
+                    opId == 0x0005 || opId == 0x0006 || opId == 0x0009 ||
+                    opId == 0x000A || opId == 0x0008);
+  // Get-Printer-Attributes / Validate-Job / Print-Job / Create-Job /
+  // Send-Document / Get-Job-Attributes / Get-Jobs / Cancel-Job
+  if (supported) {
     if (opId == 0x000B) {
       ippResp += (char)0x04;                       // printer-attributes-tag
       // NOTE ordering below follows the RFC 8011 "required order" so strict
@@ -663,7 +748,7 @@ void handleIpp(WiFiClient c) {
       attrStr(0x44, "uri-authentication-supported", "none");
       attrStr(0x42, "printer-name", PRINTER_NAME);
       attrStr(0x41, "printer-make-and-model", "ESP Print Server (parallel port)");
-      attrStr(0x41, "printer-info", "ESP32-S3 WiFi-to-LPT print server");
+      attrStr(0x41, "printer-info", PRINTER_INFO);
       attrStr(0x41, "printer-location", "LPT");
       // PWG raster first: Android wprint picks the format by exact string
       // match against document-format-supported; without image/pwg-raster
@@ -671,6 +756,14 @@ void handleIpp(WiFiClient c) {
       attrStrMulti(0x49, "document-format-supported",
                    {"image/pwg-raster", "application/vnd.hp-pcl", "application/octet-stream"});
       attrStrMulti(0x44, "ipp-versions-supported", {"1.1", "2.0"});
+      // operations-supported: the FULL set this build actually answers -
+      // clients probe it (Get-Printer-Attributes + CUPS ops) to decide
+      // whether two-step Create-Job/Send-Document may be used. The old list
+      // lacked Create-Job/Send-Document/Get-Job-Attributes/Get-Jobs/
+      // Cancel-Job, so Android's IPP stack either fell back to Print-Job or
+      // failed on its preferred path.
+      attrStrMulti(0x44, "operations-supported",
+                   {"0x0002", "0x0004", "0x0005", "0x0006", "0x0008", "0x0009", "0x000A", "0x000B"});
       // printer-state: RFC 8011 enum, emitted ONCE (a keyword "idle" copy
       // used to precede it - two attributes with the same name and
       // conflicting types in one group). Live: 5 (processing) while the
@@ -711,101 +804,116 @@ void handleIpp(WiFiClient c) {
       attrStr(0x44, "pwg-raster-document-sheet-back", "normal");
       attrStr(0x44, "printer-device-id", "MFG:ESP;MDL:PrintServer;CMD:PCL;");
       attrStrMulti(0x44, "printer-resolution-supported", {"300dpi"});
-    } else if (opId == 0x0002) {
+    } else if (opId == 0x0002 || opId == 0x0005 || opId == 0x0006) {
+      // job attributes for Print-Job / Create-Job / Send-Document.
       // REAL spool id (see PrintQueue::jobId): a hardcoded 1 pointed at a
       // phantom /job/1 that could collide with a truly spooled job #1.
-      uint32_t jid = slot >= 0 ? queue.jobId(slot) : 0;
+      uint32_t jid;
+      if (opId == 0x0002) {
+        jid = 0;   // Print-Job: id assigned when the spool opens (below)
+      } else if (opId == 0x0005) {
+        jid = slot >= 0 ? queue.jobId(slot) : 0;
+      } else {              // Send-Document: the paired job id
+        jid = (slot >= 0) ? ippOpenJobId : 0;
+      }
       ippResp += (char)0x02;                       // job attributes tag
       attrInt(0x21, "job-id", jid);                // integer
-      attrInt(0x23, "job-state", 3);               // enum: 3 = pending
+      if (opId == 0x0005) {
+        attrInt(0x23, "job-state", 3);             // pending: document not yet sent
+      } else {
+        attrInt(0x23, "job-state", 3);             // enum: 3 = pending
+      }
       attrStr(0x44, "job-state-reasons", "none");
       attrStr(0x42, "job-uri", ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/" + String(jid)).c_str());
+    } else if (opId == 0x0009 || opId == 0x000A) {   // Get-Job-Attributes / Get-Jobs
+      // honest minimal answer: no job history kept after print - completed
+      // jobs vanish from the spool, so unknown-job / empty list.
+      if (opId == 0x0009) {
+        ippResp += (char)0x02;                     // job attributes tag
+        // (job unknown: only unsupplied attributes are "unknown")
+      }
+      // Get-Jobs: no jobs-list group at all
+    } else if (opId == 0x0008) {                   // Cancel-Job
+      // cancel the pending job if it is still waiting in the spool; a job
+      // mid-print cannot be stopped mid-page (no pause/resume on LPT)
+      bool cancelled = queue.removeJobById(reqJobId ? reqJobId : ippLastCreatedId);
+      if (cancelled) Serial.printf("[ipp] Cancel-Job: removed job %u from the spool\n",
+                                    (unsigned)(reqJobId ? reqJobId : ippLastCreatedId));
+      // status stays 0 unless the job is unknown (handled by removeJobById
+      // returning false -> 0x0404 below)
+      if (!cancelled) {
+        ippResp = ippResp.substring(0, statusOff) + (char)0x04 + (char)0x04 +
+                  ippResp.substring(statusOff + 2);
+      }
     }
     ippResp += (char)0x03;                         // end-of-attributes
     bool stored = true;                            // endJob verdict (below)
     bool truncated = false;                        // transfer ended before all
                                                    // promised bytes (denied below)
     // stream the document data (after the attr groups) into the spool.
-    // Handles both Content-Length and chunked transfer, and knows the doc
-    // format (isPwg) - PWG raster files get converted to PCL at print time.
-    if (spooling && slot >= 0) {
-      queue.markFormat(slot, isPwg);
-      uint8_t buf[1024];
-      uint32_t idle = 0;
-      uint32_t spoolBytes = 0;         // bytes actually stored (for the log line)
-      long remaining = contentLength;   // -1 if chunked
-      size_t chunkLeft = 0;
-      bool chunkHeaderPending = true;   // need to read a chunk-size line first
-      bool sawTerminal = false;        // chunked: the 0-size terminal chunk arrived
-      while (c.connected() && idle < 10000) {
-        int av = c.available();
-        if (av <= 0) { idle += 10; panelPump(); continue; }   // see header comment
-        idle = 0;
-        if (chunked) {
-          if (chunkHeaderPending) {
-            String line = c.readStringUntil('\r'); c.read(); // consume \n
-            if (line.length() == 0) { truncated = true; break; }  // size line never came
-            chunkLeft = strtol(line.c_str(), NULL, 16);
-            chunkHeaderPending = false;
-            if (chunkLeft == 0) { sawTerminal = true; break; }    // terminal chunk
-            continue;
+    // Handles both Content-Length and chunked transfer via BodyStream, and
+    // knows the doc format (isPwg) - PWG raster files get converted to PCL
+    // at print time. Send-Document closes the spool; a Create-Job with no
+    // document keeps its slot open for the following Send-Document.
+    if ((opId == 0x0002 || opId == 0x0006) && slot >= 0) {
+      if (opId == 0x0002) {                     // one-shot job: open its own spool now
+        for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
+        if (slot >= 0 && (!queue.canStore() || !queue.startJob(slot))) slot = -1;
+        if (slot >= 0) {
+          rawActive[slot] = true;
+          if (engState == EngineState::IDLE) {
+            engState = EngineState::RECEIVING;
+            display.setState(UiState::RECEIVING);
           }
-          int n = c.read(buf, min((size_t)av, min(chunkLeft, sizeof(buf))));
-          chunkLeft -= n; remaining -= n; spoolBytes += n;
-          queue.write(slot, buf, n);
-          if (chunkLeft == 0) {                    // consume trailing CRLF
-            // (bugfix) this wait never incremented its own timeout counter
-            // (idle stays 0), so a client stalling right after a chunk body
-            // spun here forever - watchdog reset mid-spool. Bounded wait;
-            // if the CRLF is still incomplete, end the spool gracefully.
-            uint32_t tCrlf = millis();
-            while (c.available() < 2 && millis() - tCrlf < 1000) panelPump();
-            if (c.available() >= 2) { c.read(); c.read(); }
-            else { truncated = true; break; }
-            chunkHeaderPending = true;
-          }
-        } else {
-          if (remaining == 0) break;
-          int n = c.read(buf, min((size_t)av, min((size_t)remaining, sizeof(buf))));
-          remaining -= n; spoolBytes += n;
-          queue.write(slot, buf, n);
         }
       }
-      // A transfer that died mid-stream (disconnect, stall, missing terminal
-      // chunk, fewer bytes than Content-Length promised) is INCOMPLETE:
-      // finalizing it would print half a page while answering "OK". Cancel
-      // it and deny with client-error-bad-request; the flash-full case
-      // (endJob discarding a failed write) stays server-error-device-error.
-      if (chunked && !sawTerminal) truncated = true;      // no terminal 0-chunk seen
-      if (!chunked && remaining > 0) truncated = true;    // promised bytes missing
-      uint32_t jid = queue.jobId(slot);    // 0 after endJob - capture first
-      stored = queue.endJob(slot, truncated);
-      rawActive[slot] = false;
-      Serial.printf("[ipp] Print-Job %s: %u B (job %u)%s\n",
-                    stored ? "stored" : "DENIED", (unsigned)spoolBytes, jid,
-                    truncated ? " - truncated transfer" : "");
-      // IDLE only from RECEIVING - see the slot-taking comment above: never
-      // clobber PRINTING, or the running job's decoder restarts mid-file.
-      if (engState == EngineState::RECEIVING) {
-        engState = EngineState::IDLE;
-        display.setState(uiFor(engState));
+      if (slot >= 0) {
+        queue.markFormat(slot, isPwg);
+        uint8_t buf[1024];
+        size_t spoolBytes = 0;        // bytes actually stored (for the log line)
+        int r;
+        while ((r = bs.read(buf, sizeof(buf))) != 0) {
+          if (r < 0) { truncated = true; break; }
+          queue.write(slot, buf, (size_t)r);
+          spoolBytes += (size_t)r;
+        }
+        uint32_t jid = queue.jobId(slot);    // 0 after endJob - capture first
+        stored = queue.endJob(slot, truncated);
+        rawActive[slot] = false;
+        if (opId == 0x0006) { ippOpenSlot = -1; ippOpenJobId = 0; }
+        Serial.printf("[ipp] %s: %u B (job %u)%s\n",
+                      opId == 0x0006 ? "Send-Document" : "Print-Job",
+                      (unsigned)spoolBytes, (unsigned)jid,
+                      truncated ? " - DENIED (truncated transfer)" :
+                      stored ? " stored" : " DENIED");
+        // IDLE only from RECEIVING - see the slot-taking comment above: never
+        // clobber PRINTING, or the running job's decoder restarts mid-file.
+        if (engState == EngineState::RECEIVING) {
+          engState = EngineState::IDLE;
+          display.setState(uiFor(engState));
+        }
       }
     }
-    if (spooling && (slot < 0 || !stored)) {
+    if ((opId == 0x0002 || opId == 0x0005) && slot < 0) {
+      // Create-Job/Print-Job refused BEFORE spooling (disk full / too many
+      // concurrent jobs): 0x0506 not-accepting rather than a bare device
+      // error - the client can hold its job and retry later.
+      ippResp = ippResp.substring(0, statusOff) + (char)0x05 + (char)0x06 +
+                ippResp.substring(statusOff + 2);
+    } else if (slot >= 0 && !stored) {
       // refused BEFORE spooling (disk full / too many concurrent jobs), the
       // flash filled mid-transfer, or the transfer was truncated: tell the
       // client honestly instead of "OK" + a vanishing/half job. RFC 8011:
       // 0x0503 = server-error-device-error (our side is full/broken),
       // 0x0400 = client-error-bad-request (truncated request body).
-      // Patch the two status bytes written above via substring (String has no
-      // writable operator[] in the host test stub, substring works everywhere).
       uint16_t deny = truncated ? 0x0400 : 0x0503;
       ippResp = ippResp.substring(0, statusOff) + (char)(deny >> 8) + (char)(deny & 255) +
                 ippResp.substring(statusOff + 2);
     }
+    // final status text into the serial verdict line
     c.print(ippResp);
   } else {
-    // unsupported operation (e.g. CUPS Get-Jobs / Cancel-Job): respond with
+    // unsupported operation (e.g. CUPS Get-Notifications): respond with
     // client-error-operation-not-supported (0x040C) and a VALID attribute
     // list. The old code appended two stray bytes where attributes were
     // expected and left the success status (0x0000) in place - strict
@@ -815,6 +923,9 @@ void handleIpp(WiFiClient c) {
     ippResp += (char)0x03;                         // end-of-attributes
     c.print(ippResp);
   }
+  Serial.printf("[ipp] op=0x%04X -> %s\n", (unsigned)opId,
+                ippStatusText((uint16_t)((unsigned char)ippResp[statusOff] << 8 |
+                                        (unsigned char)ippResp[statusOff + 1])));
   c.stop();
 }
 
@@ -844,14 +955,22 @@ void setup() {
   ippServer.begin();
 
   // mDNS: advertize _ipp._tcp (Android native discovery), _pdl-datastream (raw)
+  // Per-service instance names (2.4.0): Android lists every advertised
+  // service as a candidate printer; with one shared instance name the list
+  // showed two identical "ESP32-S3 WiFi-to_LPT print server" entries and
+  // there was no telling which is IPP and which the raw socket. The suffix
+  // tells the user which endpoint a picked entry talks to. Arduino's
+  // MDNS.setInstanceName sets ONE global name for all services, so the
+  // second (socket) name goes through the IDF API the wrapper is built on.
   if (MDNS.begin(NetService::hostName().c_str())) {
-    MDNS.setInstanceName(PRINTER_NAME);
+    MDNS.setInstanceName(PRINTER_NAME);            // base name for _ipp
     MDNS.addService("ipp", "tcp", IPP_PORT);
     MDNS.addServiceTxt("ipp", "tcp", "rp", "lp");
     MDNS.addServiceTxt("ipp", "tcp", "note", PRINTER_NAME);
     MDNS.addServiceTxt("ipp", "tcp", "UUID",
       String("964") + String((uint32_t)ESP.getEfuseMac(), HEX) + "-esp32s3");
     MDNS.addService("pdl-datastream", "tcp", RAW_PORT);
+    mdns_service_instance_name_set("_pdl-datastream", "_tcp", PRINTER_NAME_SOCKET);
     MDNS.addService("http", "tcp", HTTP_PORT);
   }
 
@@ -884,25 +1003,25 @@ void loop() {
     display.setState(net.isAp() ? UiState::AP_MODE : UiState::CONNECTED);
 
   // raw 9100 accept + pump
+  // LAZY spool (2.4.0): Android/HyperOS "add printer" probes port 9100 by
+  // opening a connection and closing it without sending a byte. The old
+  // accept path opened a spool file and turned the OLED to "Загрузка
+  // данных" for every such probe - four probes, four .tmp files, "purged 4
+  // queued job(s)" after the reboot. Now the slot is only ATTACHED to the
+  // queue when the first byte arrives; probe connections that close with
+  // zero bytes leave no trace.
   WiFiClient nc = rawServer.accept();
   if (nc) {
     int slot = -1;
     for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
-    if (slot < 0 || !queue.canStore() || !queue.startJob(slot)) {
-      Serial.println("[raw] connect refused: no slot or flash full");
-      nc.stop();      // all slots busy or flash full: refuse the connection
+    if (slot < 0) {
+      Serial.println("[raw] connect refused: no slot free");
+      nc.stop();      // all slots busy: refuse the connection
     } else {
       Serial.println("[raw] connect accepted (JetDirect 9100)");
       rawClients[slot] = nc; rawActive[slot] = true;
+      rawSpooled[slot] = false;               // no spool file yet - see below
       rawLastByte[slot] = millis();
-      // RECEIVING only from IDLE. Overwriting PRINTING here would pause the
-      // in-flight job, and the later IDLE->PRINTING transition restarts the
-      // PWG decoder on a mid-file reader -> "bad sync" -> job dropped.
-      // Receiving while printing is fine: spool and print run in parallel.
-      if (engState == EngineState::IDLE) {
-        engState = EngineState::RECEIVING;
-        display.setState(UiState::RECEIVING);
-      }
     }
   }
   for (int i = 0; i < MAX_RAW_CLIENTS; i++) {
@@ -912,18 +1031,41 @@ void loop() {
       // No canStore() poll here (it walks the FS): a mid-receive fill is
       // caught exactly by PrintQueue's sticky write-failure flag - writeByte
       // returns 0 once the FS is full, endJob() then discards the truncated
-      // job instead of finalizing a half page. The accept-time check above
+      // job instead of finalizing a half page. The accept-time check below
       // covers the "already full" case.
       rawLastByte[i] = millis();
+      if (!rawSpooled[i]) {
+        // first payload byte: NOW commit the slot to the queue (startJob
+        // opens the .tmp file and the OLED goes to "Загрузка данных").
+        // canStore() / startJob() failing here means flash full: drop the
+        // connection instead of silently swallowing the job.
+        if (!queue.canStore() || !queue.startJob(i)) {
+          Serial.println("[raw] first byte refused: flash full - dropping connection");
+          rawClients[i].stop();
+          rawActive[i] = false;
+          continue;
+        }
+        rawSpooled[i] = true;
+        // RECEIVING only from IDLE. Overwriting PRINTING here would pause the
+        // in-flight job, and the later IDLE->PRINTING transition restarts the
+        // PWG decoder on a mid-file reader -> "bad sync" -> job dropped.
+        // Receiving while printing is fine: spool and print run in parallel.
+        if (engState == EngineState::IDLE) {
+          engState = EngineState::RECEIVING;
+          display.setState(UiState::RECEIVING);
+        }
+      }
       uint8_t buf[512];
       int n = rawClients[i].read(buf, min(av, (int)sizeof(buf)));
       for (int k = 0; k < n; k++) queue.writeByte(i, buf[k]);
     } else if (!rawClients[i].connected()) {
-      queue.endJob(i, false);
+      // a probe (never spooled) closes here with zero trace; a spooled
+      // client finishing its transfer finalizes the job
+      if (rawSpooled[i]) queue.endJob(i, false);
       rawClients[i].stop();
       rawActive[i] = false;
       // leave RECEIVING only (never clobber PRINTING - decoder-restart bug,
-      // see the accept comment above)
+      // see the first-byte comment above)
       if (engState == EngineState::RECEIVING) {
         engState = EngineState::IDLE;
         display.setState(uiFor(engState));
@@ -934,13 +1076,28 @@ void loop() {
       // spooled data is incomplete - cancel it (endJob discards), free the
       // slot. Real print streams never pause this long mid-job.
       Serial.printf("[raw] slot %d idle %lus - dropping ghost job\n", i, (unsigned long)RAW_IDLE_TIMEOUT_MS / 1000);
-      queue.endJob(i, true);
+      if (rawSpooled[i]) queue.endJob(i, true);
       rawClients[i].stop();
       rawActive[i] = false;
       if (engState == EngineState::RECEIVING) {
         engState = EngineState::IDLE;
         display.setState(uiFor(engState));
       }
+    }
+  }
+
+  // a Create-Job whose Send-Document never came (client died between the
+  // two calls) holds a spool slot + a .tmp file forever. Bound it: half a
+  // minute without the pairing request finalizes what arrived (usually
+  // nothing) and frees the slot.
+  if (ippOpenSlot >= 0 && millis() - ippOpenSince > 30000) {
+    Serial.println("[ipp] Create-Job pairing timed out - dropping half-open spool");
+    queue.endJob(ippOpenSlot, true);
+    rawActive[ippOpenSlot] = false;
+    ippOpenSlot = -1; ippOpenJobId = 0;
+    if (engState == EngineState::RECEIVING) {
+      engState = EngineState::IDLE;
+      display.setState(uiFor(engState));
     }
   }
 

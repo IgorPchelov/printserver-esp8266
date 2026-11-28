@@ -244,6 +244,42 @@ int main() {
     CHECK(!q.jobId(4) && !q.jobId(-1), "jobId: out-of-range slot rejected");
   }
 
+  // ---------- group 10: removeJobById (Cancel-Job, 2.4.0) ----------
+  // Cancel-Job must remove a WAITING job by id and leave the others
+  // (and their order) intact; the job the reader sits on mid-print must
+  // refuse; unknown ids must fail cleanly.
+  lfsGlueFormat();
+  {
+    PrintQueue q;
+    q.begin();
+    spool(q, 0, "J1", false);      // job 1
+    spool(q, 0, "J2", false);      // job 2
+    spool(q, 0, "J3", false);      // job 3
+    CHECK(q.pendingCount() == 3, "cancel: three jobs waiting");
+    CHECK(q.removeJobById(2), "cancel: job 2 removed by id");
+    CHECK(q.pendingCount() == 2, "cancel: pending drops to 2");
+    CHECK(!q.removeJobById(2), "cancel: same id gone -> false");
+    CHECK(!q.removeJobById(0), "cancel: id 0 rejected");
+    CHECK(!q.removeJobById(999), "cancel: unknown id -> false");
+    CHECK(q.hasData() && q.currentJobId() == 1, "cancel: job 1 still first");
+    std::string out = drain(q);
+    CHECK(out == "J1J3", "cancel: remaining jobs intact and in order");
+
+    // mid-print job cannot be cancelled: open the reader on a job
+    lfsGlueFormat();
+    PrintQueue q2;
+    q2.begin();
+    spool(q2, 0, "MID", false);
+    CHECK(q2.hasData(), "cancel-mid: reader opened on job");
+    CHECK(!q2.removeJobById(q2.currentJobId()),
+          "cancel-mid: job under the reader is refused");
+    CHECK(q2.pendingCount() == 1, "cancel-mid: pending unchanged");
+    // PWG flavour removable too
+    spool(q2, 0, "P", true);
+    CHECK(q2.removeJobById(2), "cancel: .okw job removable by id");
+    CHECK(!q2.hasData() || q2.currentJobId() != 2, "cancel: .okw gone from queue");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL QUEUE TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }

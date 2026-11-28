@@ -210,6 +210,38 @@ void PrintQueue::dropCurrent() {
   }
 }
 
+// Cancel-Job target: remove a WAITING job by its spool id. The job the
+// print engine currently feeds is NOT waiting (it is mid-page on LPT) -
+// cancelling that one is refused; the caller answers client-error-not-
+// -found so the UI does not believe a running print was cancelled.
+bool PrintQueue::removeJobById(uint32_t id) {
+  if (!id) return false;
+  if (reader && curId == id && reader.available() > 0) return false;  // mid-print
+  File dir = LittleFS.open(QUEUE_FILES_PREFIX);
+  if (!dir || !dir.isDirectory()) return false;
+  File f;
+  while ((f = dir.openNextFile())) {
+    String n = f.name();
+    f.close();
+    if (!n.startsWith("/")) n = String(QUEUE_FILES_PREFIX) + n;
+    bool pwg = n.endsWith(".okw");
+    if (!pwg && !n.endsWith(".ok")) continue;
+    uint32_t fid = (uint32_t) n.substring(n.lastIndexOf('/') + 1,
+                                           n.length() - (pwg ? 4 : 3)).toInt();
+    if (fid == id) {
+      // the reader may sit on this very file with available()==0 (exhausted
+      // but not yet advanced): hasData() would next close+remove it anyway;
+      // removing here while the reader is still open is fine (close first)
+      if (reader && curId == id) reader.close();
+      LittleFS.remove(n);
+      if (pending > 0) pending--;
+      return true;
+    }
+  }
+  dir.close();
+  return false;
+}
+
 size_t PrintQueue::usedBytes() const {
   return (size_t)LittleFS.usedBytes();
 }

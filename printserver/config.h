@@ -19,7 +19,27 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.3.0"     // 2.3.0: reboot policy - begin() purges the
+#define FIRMWARE_VERSION "2.4.0"     // 2.4.0: Android-print fix round -
+                                    //      IPP body (header AND attribute
+                                    //      walk AND document) now read
+                                    //      through one BodyStream so chunked
+                                    //      Transfer-Encoding is decoded
+                                    //      everywhere (Android/curl jobs
+                                    //      used to mis-parse and retry);
+                                    //      Create-Job/Send-Document/Get-Jobs/
+                                    //      Get-Job-Attributes/Cancel-Job
+                                    //      supported (the two-step flavour
+                                    //      Android actually uses), 0x0506 on
+                                    //      a full spool; raw 9100 lazy spool -
+                                    //      probe connections no longer open
+                                    //      .tmp files / claim "Загрузка
+                                    //      данных" on the OLED; per-service
+                                    //      mDNS names "(IPP)"/"(socket)";
+                                    //      every IPP answer logs its status
+                                    //      code; empty request lines logged
+                                    //      as port probes; bin filename
+                                    //      carries the version;
+                                    // 2.3.0: reboot policy - begin() purges the
                                     //      whole queue (no stale jobs after power-up),
                                     //      [ipp]/[raw]/[q] serial logs for connections
                                     //      and verdicts (a job that never arrived is
@@ -34,7 +54,14 @@
 
 // ---------------------------------------------------------------- Hostname / names (generic, model-agnostic)
 #define HOST_NAME_PREFIX  "ESPPrint"   // hostname/mDNS prefix; full: ESPPrint-XXXX.local
-#define PRINTER_NAME      "ESP LPT PrintServer" // advertised mDNS instance / web panel title
+// Two advertised endpoints, two DISTINGUISHABLE names (user request, 2.4.0):
+// Android lists both _ipp._tcp and _pdl-datastream._tcp as candidate
+// printers, and with identical instance names the list shows two entries
+// nobody can tell apart. Name shape follows the user's wording
+// ("ESP32 WiFi_to_LPT") with the transport the entry actually speaks.
+#define PRINTER_NAME        "ESP32 WiFi_to_LPT (IPP)"       // _ipp._tcp instance / IPP printer-name
+#define PRINTER_NAME_SOCKET "ESP32 WiFi_to_LPT (socket)"    // _pdl-datastream._tcp instance
+#define PRINTER_INFO        "ESP32 WiFi_to_LPT print server"// IPP printer-info (shared description)
 #define AP_SSID_PREFIX    "ESPPrintServer-"    // + chip id suffix
 
 // ---------------------------------------------------------------- LPT pins (Centronics / DB25)
