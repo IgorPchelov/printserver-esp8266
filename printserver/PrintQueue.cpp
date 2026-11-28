@@ -181,6 +181,7 @@ bool PrintQueue::hasData() {
     reader.close();
     LittleFS.remove(jobPath(curId, true) + (curIsPwg ? "w" : ""));
     pending--;
+    pbValid = pbFresh = false;    // job completed: no byte left to replay
   }
   // find lowest finalized id >= 1
   uint32_t best = 0;
@@ -216,8 +217,25 @@ bool PrintQueue::hasData() {
 }
 
 int PrintQueue::readByte() {
-  if (!reader || !reader.available()) return -1;
-  return reader.read();
+  if (pbValid) {
+    pbValid = false;                    // consuming the pushback slot: the
+    pbFresh = true;                      // replayed byte can itself be parked
+    return pbByte;                       // again (a busy printer retries the
+  }                                      // SAME byte indefinitely)
+  if (!reader || !reader.available()) { pbValid = false; pbFresh = false; return -1; }
+  int b = reader.read();
+  if (b >= 0) { pbByte = (uint8_t)b; pbFresh = true; }   // armable
+  return b;
+}
+
+void PrintQueue::pushback() {
+  // Arm the replay of the byte readByte() returned LAST - but only if that
+  // read was a real byte (pbFresh). After EOF (-1) or a drop/reopen there
+  // is no fresh byte, and arming a stale one would replay it twice =
+  // garbage in the printout. The replayed byte re-arms itself (pbFresh on
+  // the replay path) so a printer that stays busy for many loop() passes
+  // keeps retrying exactly the same byte, never advancing past it.
+  if (pbFresh) pbValid = true;
 }
 
 void PrintQueue::dropCurrent() {

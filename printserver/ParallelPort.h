@@ -37,8 +37,16 @@ public:
   void begin();
 
   // --- Centronics byte transfer ------------------------------------
-  // Blocks until the printer accepts the byte or timeout (ms) expires.
-  // Returns false on timeout/error (caller should abort the job).
+  // Blocks until the printer accepts the byte or the budget (ms) expires.
+  // Returns false on error. Two distinct refusals:
+  //   * out==TIMEOUT - printer busy for the whole budget; the byte was NOT
+  //     strobed, the caller should retry THIS byte after servicing the
+  //     panel (web/mDNS stay alive during long page-feed busy).
+  //   * out==DESELECTED - SELECT held low for a second (printer off/unwired);
+  //     retrying is pointless until it comes back.
+  enum class WriteResult : uint8_t { OK, TIMEOUT, DESELECTED };
+  WriteResult writeByteBudget(uint8_t b, uint32_t budgetMs);
+  // Legacy one-shot (blocking full timeout): true = byte went out.
   bool writeByte(uint8_t b, uint32_t timeoutMs);
 
   // --- Status ------------------------------------------------------

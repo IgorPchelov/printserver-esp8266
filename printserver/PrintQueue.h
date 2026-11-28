@@ -39,6 +39,13 @@ public:
   uint32_t jobId(int clientId) const;
   bool hasData();                            // oldest complete job ready to print
   int  readByte();                           // -1 = EOF
+  // Un-read the LAST byte readByte() returned (2.4.2): when the LPT write
+  // is only deferred (printer busy, not dead), the print engine parks the
+  // byte back instead of losing it, and continues in a later loop()
+  // pass after the panel was serviced. One slot deep - exactly what a
+  // deferred writeByteBudget() needs; a "dequeued and thrown away" byte
+  // would reprint garbage.
+  void pushback();                           // repeat the last read byte
   size_t currentJobSize() const { return curSize; }
   uint32_t currentJobId()  const { return curId; }
   bool currentJobIsPwg()   const { return curIsPwg; }   // true = needs PWG->PCL conversion
@@ -67,6 +74,9 @@ private:
   bool     writerIsPwg[MAX_CONCURRENT_JOBS] = {false};
   bool     writerFailed[MAX_CONCURRENT_JOBS] = {false}; // a write didn't fit
   File reader;
+  uint8_t pbByte = 0;        // pushback() slot: byte to re-read when armed
+  bool pbValid = false;      // pushback armed (set by pushback, eaten by read)
+  bool pbFresh = false;      // last readByte() returned a real byte
   uint32_t curId = 0;
   size_t curSize = 0;
   bool curIsPwg = false;

@@ -145,17 +145,20 @@ void StatusDisplay::render() {
     u8g2->drawUTF8(x2, 27, line2.c_str());             // baseline 27 keeps 12px glyphs inside 32px
   }
 
-  // --- activity icon (top-right) --------------------------------------
+  // --- activity icon (top-right): classic spinner /-\| ------------------
+  // 2.4.2: the old bar-flicker drew random-length vertical bars that read
+  // as noise ("странная анимация" - user report). A rotating stick is the
+  // universal "busy" glyph: 4 frames, 45 degrees apart, drawn as a short
+  // diagonal line in a 6x6 cell at x=122.
   if (busyAnim) {
-    const uint8_t frames[4][6] = {
-      {0x80,0x40,0x20,0x10,0x08,0x04},
-      {0x04,0x08,0x10,0x20,0x40,0x80},
-      {0x04,0x08,0x10,0x20,0x40,0x80},
-      {0x80,0x40,0x20,0x10,0x08,0x04},
-    };
-    uint8_t f = (animFrame / 2) % 4;
-    for (uint8_t i = 0; i < 6; i++)
-      u8g2->drawVLine(120 + i, 2, 6 + frames[f][i] / 32); // simple bars
+    static const uint8_t f1[] = {2,1}, f2[] = {3,2}, f3[] = {2,3}, f4[] = {1,2};
+    const uint8_t* segs[4] = {f1, f2, f3, f4};
+    const uint8_t* s = segs[animFrame & 3];
+    for (uint8_t i = 0; i < 2; i++)
+      u8g2->drawPixel(122 + s[0] + i, 2 + s[1]);
+    // center dot as the pivot: makes the rotation readable at 6 px
+    u8g2->drawPixel(124, 4);
+    u8g2->drawPixel(123, 3);
   }
 
   u8g2->sendBuffer();

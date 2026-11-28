@@ -179,6 +179,50 @@ bool ParallelPort::writeByte(uint8_t b, uint32_t timeoutMs) {
   return true;
 }
 
+// Budget write (2.4.2): same transfer as writeByte, but when the printer
+// stays busy for the whole budget it returns TIMEOUT *without strobing* -
+// the caller retries the same byte after servicing the panel (web, mDNS,
+// OLED, LED). This is what keeps loop() responsive during long page-feed
+// busy periods and, on a hung-BUSY emulator, turns a two-minute total
+// freeze into "printing, but no data goes out" with the web UI alive.
+ParallelPort::WriteResult ParallelPort::writeByteBudget(uint8_t b, uint32_t budgetMs) {
+  uint32_t start = millis();
+  bool selLow = false;
+  uint32_t selLowSince = 0;
+  while (!isAccepting()) {
+    if (digitalRead(PIN_LPT_ERROR) == LOW || digitalRead(PIN_LPT_PE) == HIGH)
+      return WriteResult::DESELECTED;      // error/paper-out: operator problem
+    if (digitalRead(PIN_LPT_SELECT) == HIGH) {
+      selLow = false;
+    } else if (!selLow) {
+      selLow = true; selLowSince = millis();
+    } else if (millis() - selLowSince >= 1000) {
+      return WriteResult::DESELECTED;      // deselected for a solid second
+    }
+    if (millis() - start > budgetMs) return WriteResult::TIMEOUT;
+    delayMicroseconds(20);
+  }
+  // ready: strobe the byte out (setup/hold times from the writeByte path)
+  for (int i = 0; i < 8; i++) digitalWrite(DATA_PINS[i], (b >> i) & 1);
+  delayMicroseconds(T_DS_SETUP_US);
+  digitalWrite(PIN_LPT_STROBE, LOW);
+  delayMicroseconds(T_STROBE_LOW_US);
+  digitalWrite(PIN_LPT_STROBE, HIGH);
+  // BUSY rose-and-fell / ACK seen / 10 ms - same acceptance wait as
+  // writeByte; a printer that never latches BUSY still completes here.
+  uint32_t tAccept = millis();
+  bool sawBusy = false;
+  while (true) {
+    bool busy = digitalRead(PIN_LPT_BUSY) == HIGH;
+    if (busy) sawBusy = true;
+    if (digitalRead(PIN_LPT_ACK) == LOW) ackFlag = true;
+    if (sawBusy && !busy) break;
+    if (!sawBusy && digitalRead(PIN_LPT_ACK) == LOW) break;
+    if (millis() - tAccept > 10) break;
+  }
+  return WriteResult::OK;
+}
+
 void ParallelPort::poll() {
   // Self-healing wiring mask: a line asserting its active level IS driven
   // by a real printer, so mark it wired from now on. A floating line,

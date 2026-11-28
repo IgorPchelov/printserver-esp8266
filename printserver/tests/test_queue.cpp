@@ -306,6 +306,38 @@ int main() {
           "registry: newest id still known");
   }
 
+  // ---------- group 12: pushback (non-blocking engine, 2.4.2) ----------
+  // readByte -> pushback -> readByte must replay the SAME byte once, then
+  // continue in order. A byte lost or doubled here reprints garbage.
+  lfsGlueFormat();
+  {
+    PrintQueue q;
+    q.begin();
+    spool(q, 0, "ABC", false);          // job 1 = "ABC"
+    CHECK(q.hasData(), "pushback: job ready");
+    int b1 = q.readByte();
+    CHECK(b1 == 'A', "pushback: first read = A");
+    q.pushback();
+    int b2 = q.readByte();
+    CHECK(b2 == 'A', "pushback: replayed byte = A (not lost)");
+    int b3 = q.readByte();
+    int b4 = q.readByte();
+    CHECK(b3 == 'B' && b4 == 'C', "pushback: stream continues B, C in order");
+    // after an EOF read the pushback slot is spent: arming without a fresh
+    // byte must NOT replay the last byte again (a doubled byte = garbage)
+    CHECK(q.readByte() == -1, "pushback: stream at EOF after C");
+    q.pushback();
+    CHECK(q.readByte() == -1, "pushback: after EOF no byte is resurrected");
+    // the honest use right after a successful read: C is held back and
+    // replayed (printer busy retry) - already covered above with A
+    spool(q, 0, "XY", false);           // new job for a cross-boundary replay
+    CHECK(q.hasData(), "pushback: next job ready");
+    int x1 = q.readByte();
+    CHECK(x1 == 'X', "pushback: new job reads X");
+    q.pushback();
+    CHECK(q.readByte() == 'X', "pushback: replay across the boundary stays exact");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL QUEUE TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }

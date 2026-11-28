@@ -19,7 +19,18 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.4.1"     // 2.4.1: Print-Job regression fix - the
+#define FIRMWARE_VERSION "2.4.2"     // 2.4.2: non-blocking print engine - a
+                                    //      busy/hung printer no longer
+                                    //      freezes loop() for 120 s PER BYTE
+                                    //      (web UI dead, mDNS dead, box
+                                    //      "hung" - field report): writeByte
+                                    //      gets a 20 ms budget, the byte is
+                                    //      pushed back and retried after the
+                                    //      panel (web/OLED/LED) is serviced;
+                                    //      OLED activity icon is now the
+                                    //      classic /-\| spinner (old random
+                                    //      bars read as noise);
+                                    // 2.4.1: Print-Job regression fix - the
                                     //      slot-open code sat inside a
                                     //      `slot >= 0` guard (a catch-22), so
                                     //      EVERY Print-Job was answered with
@@ -145,6 +156,13 @@
 #define T_STROBE_LOW_US   2    // STROBE low pulse width (>=0.5 us, typ 1..5)
 #define T_STROBE_HI_WAIT  1    // data hold after STROBE rising (>=0.5 us)
 #define LPT_BUSY_TIMEOUT_MS 120000UL // hard cap while printer is busy (page feed)
+#define LPT_BYTE_BUDGET_MS    20UL // per-byte write budget in the non-blocking
+                                    // engine (2.4.2): a busy printer holds the
+                                    // engine for at most this long per byte,
+                                    // then loop() takes over and services the
+                                    // panel/web/mDNS. 20 ms stays invisible to
+                                    // print throughput on a real printer.
+#define LPT_PANEL_SERVICE_MS  50UL // panel pump cadence inside busy retries
 
 // ---------------------------------------------------------------- Network
 #define HTTP_PORT         80

@@ -107,6 +107,31 @@ void feedByteToLpt(uint8_t b) {
   display.setState(uiFor(engState));
 }
 
+// Deferred-write outcome for the non-blocking engine loop: OK went to the
+// port, TIMEOUT means "printer busy the whole budget - byte NOT sent",
+// DESELECTED means "printer gone/offline - stop trying".
+
+// One byte of RAW job data -> LPT, non-blocking flavour (2.4.2). On TIMEOUT
+// the byte is pushed back and retried in a later loop() pass; on
+// DESELECTED the whole job is held (printer offline, wait for SELECT) or
+// dropped (nothing ever wired). Long-busy waits no longer freeze loop():
+// the panel (web/mDNS/OLED/LED) is serviced between single-byte retries.
+ParallelPort::WriteResult feedByteBudget(uint8_t b, uint32_t budgetMs) {
+  ParallelPort::WriteResult r = lpt.writeByteBudget(b, budgetMs);
+  if (r == ParallelPort::WriteResult::OK) { printBytes++; return r; }
+  if (r == ParallelPort::WriteResult::TIMEOUT) {
+    // a full-budget busy with zero progress and a SELECT present: this is
+    // a hung interface, not page-feed busy. Give it ONE recovery - the
+    // INIT pulse - then report; the engine decides drop vs hold.
+    lpt.resetPrinter();
+    if (lpt.writeByteBudget(b, 50) == ParallelPort::WriteResult::OK) {
+      printBytes++;
+      return ParallelPort::WriteResult::OK;
+    }
+  }
+  return r;
+}
+
 // ---- BOOT button: hold BTN_HOLD_MS to force the configuration AP --------
 // Polled in loop() and in the blocking-connect pumps (net.waitConnected /
 // net.connectTo), so the button also works while the box is stuck joining
@@ -158,6 +183,10 @@ void panelPump() {
 PwgToPcl pwg;
 bool pwgActive = false;
 bool pwgFailed = false;
+// Panel service bookkeeping for the non-blocking print engine (2.4.2):
+// while the engine waits out a busy printer, the OLED/LED/LPT poll and the
+// web/mDNS stack still get their slice between single-byte retries.
+uint32_t lastPanelService = 0;
 // Job id the print engine currently works on. hasData() advances the reader
 // to the NEXT queued job (silently - it closes/removes the old file and
 // opens the new one inside the while-condition), so this id is compared on
@@ -250,8 +279,40 @@ void processQueue() {
         if (!pwg.feed((uint8_t)b)) { pwgFailed = true; break; }
         // pwgOut() already counts the CONVERTED bytes actually pushed to the
         // port; counting the source bytes here too would double-increment.
+        // A deferred (busy) OUTPUT byte cannot be replayed through the
+        // decoder: pwgOut() already consumed the raster input. The decoder
+        // stalls instead (PwgToPcl's own output stall handling reports the
+        // error and the job drops as "output stalled") - PWG jobs on a
+        // busy port are rare enough (Android renders ahead of the port).
       } else {
-        feedByteToLpt((uint8_t)b);
+        // NON-BLOCKING raw path (2.4.2): a small per-byte budget, then
+        // return to loop() - web/mDNS/OLED keep running while the printer
+        // chews on the last byte. The deferred byte goes back to the queue
+        // (pushback) and is retried on the next pass.
+        ParallelPort::WriteResult r = feedByteBudget((uint8_t)b, LPT_BYTE_BUDGET_MS);
+        if (r == ParallelPort::WriteResult::TIMEOUT) {
+          queue.pushback();              // same byte again, later pass
+          if (millis() - lastPanelService > LPT_PANEL_SERVICE_MS) {
+            panelPump();                 // OLED/LED/LPT poll/button live
+            lastPanelService = millis();
+          }
+          return;                        // give loop() the rest of the slice
+        }
+        if (r == ParallelPort::WriteResult::DESELECTED) {
+          // SELECT fell for a solid second: printer off / offline. Wired
+          // before -> hold the job (resumes when SELECT returns); never
+          // wired -> dead port, drop with the honest reason.
+          if (lpt.selectEverWired()) {
+            display.setPrinterStatus(LptStatus::OFFLINE);
+            queue.pushback();
+            return;                      // hold; processQueue re-checks above
+          }
+          queue.dropCurrent();
+          engState = EngineState::IDLE;
+          display.setError("нет ответа LPT");
+          display.setState(uiFor(engState));
+          return;
+        }
         printBytes++;
       }
       n++;
@@ -264,6 +325,8 @@ void processQueue() {
       display.setState(uiFor(engState));
     }
   }
+  // panel service timestamp (shared by the deferred-write path)
+  lastPanelService = millis();
 }
 
 // ---------------- HTTP helpers ----------------
