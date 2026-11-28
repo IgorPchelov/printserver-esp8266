@@ -19,7 +19,25 @@
 // it, so anyone can tell which build a flashed box is running. Minor for
 // notable features, patch for small tweaks/fixes.
 #define FIRMWARE_NAME    "ESP Print Server"
-#define FIRMWARE_VERSION "2.4.0"     // 2.4.0: Android-print fix round -
+#define FIRMWARE_VERSION "2.4.1"     // 2.4.1: Print-Job regression fix - the
+                                    //      slot-open code sat inside a
+                                    //      `slot >= 0` guard (a catch-22), so
+                                    //      EVERY Print-Job was answered with
+                                    //      server-error-not-accepting-jobs on
+                                    //      a perfectly healthy empty box;
+                                    //      capacity now taken BEFORE parsing,
+                                    //      same path as Create-Job, refusal
+                                    //      reason in the log. Plus: WiFi modem
+                                    //      sleep disabled (mDNS answers lost -
+                                    //      the Android printer list flickered:
+                                    //      "shows for a second, then gone");
+                                    //      Get-Job-Attributes answers from a
+                                    //      live job-state registry (pending /
+                                    //      processing / completed) instead of
+                                    //      unknown-job (Android notification
+                                    //      flipped to failed while the job
+                                    //      sat in the spool);
+                                    // 2.4.0: Android-print fix round -
                                     //      IPP body (header AND attribute
                                     //      walk AND document) now read
                                     //      through one BodyStream so chunked

@@ -188,6 +188,7 @@ void engineSwitchJob() {
     pwgActive = false;
   }
   engineJobId = queue.currentJobId();
+  queue.markJobState(engineJobId, 5);   // processing: engine feeds this job now
   if (queue.currentJobIsPwg()) {
     pwg.begin(pwgOut, nullptr);    // fresh decoder state for the new job
     pwgActive = true;
@@ -258,6 +259,7 @@ void processQueue() {
     if (engState != EngineState::PRINTING) return;   // dropped mid-job above
     if (!queue.hasData() && !pwgFailed) {
       if (pwgActive) { pwg.end(); pwgActive = false; }
+      queue.markJobState(engineJobId, 9);   // completed: last job printed
       engState = EngineState::IDLE;
       display.setState(uiFor(engState));
     }
@@ -607,21 +609,36 @@ void handleIpp(WiFiClient c) {
 
   bool createJob = (opId == 0x0005);  // Create-Job
   bool sendDoc   = (opId == 0x0006);  // Send-Document
+  bool printJob  = (opId == 0x0002);  // Print-Job (one-shot: attrs + doc)
   int slot = -1;
-  if (createJob) {
-    // Same capacity gate as raw-accept and Print-Job.
+  // Capacity is taken BEFORE parsing attributes, the same instant the
+  // request is classified - and the SAME code path for Print-Job and
+  // Create-Job. 2.4.0 regression: Print-Job took its slot inside a branch
+  // guarded by `slot >= 0` (a catch-22: the slot only opens if already
+  // open), so every Print-Job fell to the "not accepting" answer -
+  // `op=0x0002 -> server-error-not-accepting-jobs` in the monitor with a
+  // healthy empty box. Create-Job/Send-Document were unaffected, which
+  // is why the printer still added and queried fine.
+  if (createJob || printJob) {
     for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
     if (slot >= 0 && (!queue.canStore() || !queue.startJob(slot))) slot = -1;
     if (slot >= 0) {
       rawActive[slot] = true;
-      ippOpenSlot = slot; ippOpenJobId = queue.jobId(slot); ippOpenSince = millis();
-      ippLastCreatedId = ippOpenJobId;
       if (engState == EngineState::IDLE) {
         engState = EngineState::RECEIVING;
         display.setState(UiState::RECEIVING);
       }
     }
-  } else if (sendDoc) {
+  }
+  if (createJob && slot >= 0) {
+    ippOpenSlot = slot; ippOpenJobId = queue.jobId(slot); ippOpenSince = millis();
+    ippLastCreatedId = ippOpenJobId;
+  }
+  if (printJob && slot < 0)
+    Serial.println("[ipp] Print-Job refused: no slot free or flash full");
+  if (createJob && slot < 0)
+    Serial.println("[ipp] Create-Job refused: no slot free or flash full");
+  if (sendDoc) {
     // Pair with the job Create-Job opened. Android does Create-Job ->
     // Send-Document on the same connection; the job-id attribute in the
     // request may be absent (implicit "last created").
@@ -810,7 +827,7 @@ void handleIpp(WiFiClient c) {
       // phantom /job/1 that could collide with a truly spooled job #1.
       uint32_t jid;
       if (opId == 0x0002) {
-        jid = 0;   // Print-Job: id assigned when the spool opens (below)
+        jid = slot >= 0 ? queue.jobId(slot) : 0;   // slot already opened above
       } else if (opId == 0x0005) {
         jid = slot >= 0 ? queue.jobId(slot) : 0;
       } else {              // Send-Document: the paired job id
@@ -826,13 +843,28 @@ void handleIpp(WiFiClient c) {
       attrStr(0x44, "job-state-reasons", "none");
       attrStr(0x42, "job-uri", ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/" + String(jid)).c_str());
     } else if (opId == 0x0009 || opId == 0x000A) {   // Get-Job-Attributes / Get-Jobs
-      // honest minimal answer: no job history kept after print - completed
-      // jobs vanish from the spool, so unknown-job / empty list.
-      if (opId == 0x0009) {
+      // 2.4.1: answer from the job-state registry (PrintQueue). Android
+      // polls these right after Print-Job - an "unknown-job" answer made
+      // its notification flip to failed while the job sat in the spool.
+      // Known ids get their live state (3 pending / 5 processing /
+      // 9 completed); truly unknown ids keep the honest not-found status.
+      uint32_t wanted = reqJobId ? reqJobId : ippLastCreatedId;
+      uint8_t st = queue.jobStateOf(wanted);
+      if (st) {
         ippResp += (char)0x02;                     // job attributes tag
-        // (job unknown: only unsupplied attributes are "unknown")
+        attrInt(0x21, "job-id", wanted);           // integer
+        attrInt(0x23, "job-state", st);            // enum: 3/5/9 (see registry)
+        attrStr(0x44, "job-state-reasons", "none");
+        attrStr(0x42, "job-uri",
+                ("ipp://" + net.ip() + ":" + String(IPP_PORT) + "/lp/job/" + String(wanted)).c_str());
+      } else if (opId == 0x0009) {
+        // job genuinely unknown (never seen this boot): not-found
+        ippResp = ippResp.substring(0, statusOff) + (char)0x04 + (char)0x04 +
+                  ippResp.substring(statusOff + 2);
+        ippResp += (char)0x02;                     // job attributes tag
       }
-      // Get-Jobs: no jobs-list group at all
+      // Get-Jobs: registry is a rolling window, not a list - empty answer
+      // is legal (which-jobs=completed clients re-query attributes by id)
     } else if (opId == 0x0008) {                   // Cancel-Job
       // cancel the pending job if it is still waiting in the spool; a job
       // mid-print cannot be stopped mid-page (no pause/resume on LPT)
@@ -856,18 +888,10 @@ void handleIpp(WiFiClient c) {
     // at print time. Send-Document closes the spool; a Create-Job with no
     // document keeps its slot open for the following Send-Document.
     if ((opId == 0x0002 || opId == 0x0006) && slot >= 0) {
-      if (opId == 0x0002) {                     // one-shot job: open its own spool now
-        for (int i = 0; i < MAX_RAW_CLIENTS; i++) if (!rawActive[i]) { slot = i; break; }
-        if (slot >= 0 && (!queue.canStore() || !queue.startJob(slot))) slot = -1;
-        if (slot >= 0) {
-          rawActive[slot] = true;
-          if (engState == EngineState::IDLE) {
-            engState = EngineState::RECEIVING;
-            display.setState(UiState::RECEIVING);
-          }
-        }
-      }
-      if (slot >= 0) {
+      // slot was taken at request classification (see the capacity-gate
+      // comment above): Print-Job and Create-Job BEFORE attribute parsing,
+      // Send-Document from the Create-Job pairing. Spool straight here.
+      {
         queue.markFormat(slot, isPwg);
         uint8_t buf[1024];
         size_t spoolBytes = 0;        // bytes actually stored (for the log line)

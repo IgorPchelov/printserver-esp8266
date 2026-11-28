@@ -37,6 +37,13 @@ void NetService::begin() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostName().c_str());
   WiFi.setAutoReconnect(true);
+  // mDNS reliability (2.4.1): default modem sleep lets the radio doze off
+  // between beacons, which delays or loses mDNS responses - the Android
+  // printer list then shows the service only for the moment a reply
+  // happened to slip through ("shows for a second, then gone"). A print
+  // server must be discoverable at all times; power draw is a non-issue
+  // on mains-powered hardware.
+  WiFi.setSleep(false);
   // how the join is started, and how the display learns the SSID:
   // - stored credentials: plain WiFi.begin() reads them from NVS
   // - a new SSID from the web page: WiFi.begin(ssid, pass) writes them

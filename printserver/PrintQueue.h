@@ -47,6 +47,14 @@ public:
   // Cancel-Job support: remove a WAITING job by spool id. Mid-print jobs
   // are refused (LPT has no pause/resume); unknown ids return false.
   bool removeJobById(uint32_t id);
+  // Job-state registry for Get-Job-Attributes (2.4.1): Android polls job
+  // state right after submitting; "unknown-job" made the notification flip
+  // to failed/unresponsive while the job was actually queued. States:
+  // 3 = pending (waiting in the spool), 5 = processing (engine feeds it),
+  // 9 = completed (printed; kept as history, no file behind it anymore).
+  static const uint32_t JOB_HISTORY = 8;         // remember the last N jobs
+  uint8_t jobStateOf(uint32_t id) const;        // 0 = unknown
+  void markJobState(uint32_t id, uint8_t state); // registry upkeep
   size_t usedBytes() const;
   int pendingCount() const { return pending; }
   // How many queued jobs (both flavours) the last begin() removed from /q
@@ -67,6 +75,10 @@ private:
   uint32_t doneCount = 0;
   int pending = 0;
   int purgedBoot = 0;        // jobs begin() removed this boot (see purgedAtBoot())
+  // rolling job-state registry (jobStateOf/markJobState), oldest replaced
+  uint32_t histIds[JOB_HISTORY] = {0};
+  uint8_t  histStates[JOB_HISTORY] = {0};
+  uint32_t histNext = 0;     // ring index
   void rescan();            // rebuild pending count from directory listing
   void cleanupStale();      // remove orphaned non-finalized files
   void purgeAll();          // reboot policy: drop every job from /q

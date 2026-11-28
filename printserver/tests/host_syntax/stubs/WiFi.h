@@ -47,6 +47,7 @@ public:
   void mode(int) {}
   bool setHostname(const String&) { return true; }
   void setAutoReconnect(bool) {}
+  void setSleep(bool) {}
   void begin(const char* = 0, const char* = 0) {}
   bool disconnect(bool = false) { return true; }
   void reconnect() {}

@@ -146,10 +146,28 @@ bool PrintQueue::endJob(int clientId, bool cancel) {
     pending++;
     doneCount++;
     finalized = true;
+    markJobState(id, 3);   // pending: waiting for the print engine
   }
   writerIsPwg[clientId] = false;
   writerFailed[clientId] = false;
   return finalized;
+}
+
+// ---- job-state registry (Get-Job-Attributes; see PrintQueue.h) ----
+void PrintQueue::markJobState(uint32_t id, uint8_t state) {
+  if (!id) return;
+  for (uint32_t i = 0; i < JOB_HISTORY; i++)
+    if (histIds[i] == id) { histStates[i] = state; return; }   // update in place
+  histIds[histNext] = id;          // new entry, oldest slot replaced
+  histStates[histNext] = state;
+  histNext = (histNext + 1) % JOB_HISTORY;
+}
+
+uint8_t PrintQueue::jobStateOf(uint32_t id) const {
+  if (!id) return 0;
+  for (uint32_t i = 0; i < JOB_HISTORY; i++)
+    if (histIds[i] == id) return histStates[i];
+  return 0;   // unknown
 }
 
 uint32_t PrintQueue::jobId(int clientId) const {

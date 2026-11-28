@@ -280,6 +280,32 @@ int main() {
     CHECK(!q2.hasData() || q2.currentJobId() != 2, "cancel: .okw gone from queue");
   }
 
+  // ---------- group 11: job-state registry (Get-Job-Attributes, 2.4.1) ----------
+  // endJob -> 3 (pending); engineSwitchJob/markJobState -> 5 (processing);
+  // print end -> 9 (completed). Rolling window of JOB_HISTORY; unknown = 0.
+  lfsGlueFormat();
+  {
+    PrintQueue q;
+    q.begin();
+    CHECK(q.jobStateOf(1) == 0, "registry: unseen id is unknown (0)");
+    spool(q, 0, "A", false);                          // job 1 -> pending
+    CHECK(q.jobStateOf(1) == 3, "registry: fresh spool = pending (3)");
+    q.markJobState(1, 5);                              // engine starts it
+    CHECK(q.jobStateOf(1) == 5, "registry: mark processing (5)");
+    q.markJobState(1, 9);                              // engine finished it
+    CHECK(q.jobStateOf(1) == 9, "registry: mark completed (9)");
+    CHECK(q.jobStateOf(2) == 0, "registry: other id still unknown");
+    // rolling window: JOB_HISTORY+2 distinct ids push id 1 out
+    for (uint32_t i = 2; i <= PrintQueue::JOB_HISTORY + 3; i++) {
+      q.startJob(0);
+      q.write(0, (const uint8_t*)"x", 1);
+      q.endJob(0, false);
+    }
+    CHECK(q.jobStateOf(1) == 0, "registry: window rolls, oldest forgotten");
+    CHECK(q.jobStateOf(PrintQueue::JOB_HISTORY + 3) == 3,
+          "registry: newest id still known");
+  }
+
   printf(failures ? "\n%d FAILURES\n" : "\nALL QUEUE TESTS PASSED\n", failures);
   return failures ? 1 : 0;
 }
